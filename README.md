@@ -89,6 +89,14 @@ Pipeline runs write outputs to the configured `out_dir`:
 - `processed_ids.txt`: resume/progress log.
 - Optional CIF exports when enabled in `OutputConfig`.
 
+## Tests
+
+Run the lightweight test suite with:
+
+```bash
+python -m unittest discover -s tests
+```
+
 ## Documentation
 
 See `documentation.md` for detailed information about detector arguments,

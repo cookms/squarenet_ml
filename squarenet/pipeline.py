@@ -12,6 +12,8 @@ import pandas as pd
 from .config import PipelineConfig
 from .mp_query import search_candidates, fetch_structure, load_material_ids_txt
 from .io import ensure_dir, dump_cif, update_processed_ids_log, append_tables_v2
+from .detect import find_square_net_planes
+from .summarize import summarize_square_net_one_material_v2
 
 
 def _read_existing_table(out_dir: str, name: str) -> Optional[pd.DataFrame]:
@@ -282,6 +284,10 @@ def run_pipeline(cfg: "PipelineConfig") -> Tuple[pd.DataFrame, pd.DataFrame]:
         except Exception as e:
             print(f"[flush] final flush failed: {e}")
 
-    materials_out = _read_existing_table(out_dir, "materials") or pd.DataFrame()
-    axis_species_out = _read_existing_table(out_dir, "axis_species") or pd.DataFrame()
+    materials_out = _read_existing_table(out_dir, "materials")
+    axis_species_out = _read_existing_table(out_dir, "axis_species")
+    if materials_out is None:
+        materials_out = pd.DataFrame()
+    if axis_species_out is None:
+        axis_species_out = pd.DataFrame()
     return materials_out, axis_species_out

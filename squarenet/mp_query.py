@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from typing import Optional, List, Dict, Any
 
 from pymatgen.core import Structure
+from pymatgen.symmetry.analyzer import SpacegroupAnalyzer
 
 try:
     from mp_api.client import MPRester

@@ -1,7 +1,7 @@
 
 import numpy as np
 from dataclasses import dataclass, field
-from typing import List, Dict, Optional, Tuple
+from typing import Any, List, Dict, Optional, Tuple
 from scipy.spatial import cKDTree
 from functools import lru_cache
 
@@ -64,32 +64,66 @@ def _tile_in_plane(cart: np.ndarray, lattice_matrix: np.ndarray, axis: int) -> T
     origin = np.tile(np.arange(n, dtype=int), len(shifts))
     return tiled, origin
 
-def _square_score_site(v2d: np.ndarray, len_tol: float, ang_tol_deg: float) -> Tuple[float, Dict[str, float]]:
+def _in_plane_image_offsets(axis: int) -> np.ndarray:
+    """Return fractional image offsets in the same order as _tile_in_plane."""
+    other = [0, 1, 2]
+    other.remove(axis)
+    offsets = []
+    for i in (-1, 0, 1):
+        for j in (-1, 0, 1):
+            off = np.zeros(3, dtype=int)
+            off[other[0]] = i
+            off[other[1]] = j
+            offsets.append(off)
+    return np.array(offsets, dtype=int)
+
+def _square_score_site(
+    v2d: np.ndarray,
+    len_tol: float,
+    ang_tol_deg: float,
+    return_details: bool = False,
+):
     nan_info = {"du": float("nan"), "dv": float("nan"), "len_err": float("nan"), "ang_deg": float("nan"), "ang_err": float("nan")}
+    empty_details = {
+        "scored_neighbor_positions": [],
+        "u_position": None,
+        "v_position": None,
+        "opposite_u_position": None,
+        "opposite_v_position": None,
+        "has_opposite_u": False,
+        "has_opposite_v": False,
+    }
 
     if v2d.shape[0] < 4:
-        return 0.0, nan_info
+        return (0.0, nan_info, empty_details) if return_details else (0.0, nan_info)
 
     d = np.linalg.norm(v2d, axis=1)
     order = np.argsort(d)
     v = v2d[order[:8]]
+    details = dict(empty_details)
+    details["scored_neighbor_positions"] = [int(x) for x in order[:8].tolist()]
 
     u = v[0]
+    u_pos = int(order[0])
+    details["u_position"] = u_pos
     du = np.linalg.norm(u)
     if du < 1e-12:
-        return 0.0, nan_info
+        return (0.0, nan_info, details) if return_details else (0.0, nan_info)
 
     vvec = None
-    for cand in v[1:]:
+    v_pos = None
+    for local_pos, cand in enumerate(v[1:], start=1):
         dv = np.linalg.norm(cand)
         if dv < 1e-12:
             continue
         cross = abs(u[0] * cand[1] - u[1] * cand[0])
         if cross / (du * dv + 1e-15) > np.sin(np.deg2rad(10.0)):
             vvec = cand
+            v_pos = int(order[local_pos])
             break
     if vvec is None:
-        return 0.0, nan_info
+        return (0.0, nan_info, details) if return_details else (0.0, nan_info)
+    details["v_position"] = v_pos
 
     dv = np.linalg.norm(vvec)
 
@@ -100,22 +134,33 @@ def _square_score_site(v2d: np.ndarray, len_tol: float, ang_tol_deg: float) -> T
 
     len_err = float(abs(du - dv) / max((du + dv) * 0.5, 1e-12))
 
-    def has_opposite(vec: np.ndarray, vecs: np.ndarray, tol: float) -> bool:
+    def opposite_position(vec: np.ndarray, vecs: np.ndarray, source_positions: np.ndarray, tol: float):
         target = -vec
         dd = np.linalg.norm(vecs - target[None, :], axis=1)
-        return float(np.min(dd)) <= tol
+        if dd.size == 0:
+            return False, None
+        imin = int(np.argmin(dd))
+        ok = float(dd[imin]) <= tol
+        return ok, int(source_positions[imin]) if ok else None
 
     opp_tol = 0.15 * max(du, dv)
-    opp_ok = has_opposite(u, v, opp_tol) and has_opposite(vvec, v, opp_tol)
+    has_opp_u, opp_u_pos = opposite_position(u, v, order[:8], opp_tol)
+    has_opp_v, opp_v_pos = opposite_position(vvec, v, order[:8], opp_tol)
+    details["has_opposite_u"] = bool(has_opp_u)
+    details["has_opposite_v"] = bool(has_opp_v)
+    details["opposite_u_position"] = opp_u_pos
+    details["opposite_v_position"] = opp_v_pos
+    opp_ok = has_opp_u and has_opp_v
     if not opp_ok:
-        return 0.0, {"du": du, "dv": dv, "len_err": len_err, "ang_deg": ang_deg, "ang_err": ang_err}
+        info = {"du": du, "dv": dv, "len_err": len_err, "ang_deg": ang_deg, "ang_err": ang_err}
+        return (0.0, info, details) if return_details else (0.0, info)
 
     s_len = float(np.exp(-(len_err / max(len_tol, 1e-6)) ** 2))
     s_ang = float(np.exp(-(ang_err / max(ang_tol_deg, 1e-6)) ** 2))
     score = s_len * s_ang
 
     info = {"du": du, "dv": dv, "len_err": len_err, "ang_deg": ang_deg, "ang_err": ang_err}
-    return score, info
+    return (score, info, details) if return_details else (score, info)
 
 
 def _tile_shifts_3d(lattice_matrix: np.ndarray) -> np.ndarray:
@@ -148,6 +193,36 @@ def _safe_ratio(num: float, den: float) -> float:
     if not np.isfinite(num) or not np.isfinite(den) or den <= 0:
         return float("nan")
     return float(num / den)
+
+
+@dataclass
+class LayerVisualizationData:
+    """Optional detector diagnostics used by squarenet.visualization.
+
+    The arrays here are not needed for tabular ML exports and are only
+    populated when find_square_net_planes(..., preserve_visualization_data=True)
+    is requested.
+    """
+
+    candidate_site_indices: np.ndarray
+    candidate_plane_indices: np.ndarray
+    adjacent_plane_indices_by_side: Dict[str, np.ndarray]
+    adjacent_plane_centers_frac_by_side: Dict[str, float]
+    plane_cartesian_basis: np.ndarray
+    plane_normal: np.ndarray
+    plane_center_cartesian: np.ndarray
+    projected_coordinates: np.ndarray
+    tiled_projected_coordinates: np.ndarray
+    tiled_origin_indices: np.ndarray
+    tiled_image_offsets: np.ndarray
+    local_site_scores: np.ndarray
+    local_site_pass_flags: np.ndarray
+    local_site_details: List[Dict[str, Any]]
+    selected_neighbor_edges: List[Dict[str, Any]]
+    adjacent_atom_connections: Dict[str, Dict[str, Any]]
+    neighbor_length_measurements: np.ndarray
+    neighbor_angle_measurements: np.ndarray
+    detector_thresholds: Dict[str, float]
 
 
 @dataclass
@@ -249,6 +324,10 @@ class SquarePlaneResult:
     # Debugging: why passes2 failed (empty list => passes2 True)
     passes2_fail_reasons: List[str] = field(default_factory=list)
 
+    # Optional visualization diagnostics. Kept out of normal detector runs by
+    # default because these arrays are useful for figures, not tabular exports.
+    visualization_data: Optional[LayerVisualizationData] = None
+
     
 
 
@@ -263,6 +342,7 @@ def find_square_net_planes(
     min_pass_fraction: float = 0.6,
     score_threshold: float = 0.5,
     return_all: bool = True,   # return failing cases too
+    preserve_visualization_data: bool = False,
     adjacent_by: str = "atom",   # NEW: "atom" (current) or "plane"
 
     # --- passes2 criteria (optional bounds; None = ignore) ---
@@ -500,6 +580,9 @@ def find_square_net_planes(
                 tiled_cart, origin_inplane = _tile_in_plane(cart, lat, axis=aidx)
                 tiled_2d = np.column_stack([tiled_cart @ e1, tiled_cart @ e2])
                 base_2d = np.column_stack([cart @ e1, cart @ e2])
+                image_offsets_inplane = _in_plane_image_offsets(aidx)
+                tiled_image_offsets = np.repeat(image_offsets_inplane, len(cart), axis=0)
+                tiled_global_indices = idx[origin_inplane]
 
                 tree = cKDTree(tiled_2d)
 
@@ -519,17 +602,35 @@ def find_square_net_planes(
                 uv_ang_errs = []
                 u_lengths = []
                 v_lengths = []
+                local_site_details: List[Dict[str, Any]] = []
+                selected_neighbor_edges: List[Dict[str, Any]] = []
+                neighbor_length_measurements: List[float] = []
+                neighbor_angle_measurements: List[float] = []
                 
                 for si in range(len(base_2d)):
                     p = base_2d[si]
                     d, nn = tree.query(p, k=k_nn)
                     nn = np.atleast_1d(nn)
+                    d = np.atleast_1d(d)
+                    valid_nn = (nn >= 0) & (nn < len(tiled_2d)) & np.isfinite(d)
+                    nn = nn[valid_nn]
                 
                     vecs_all = tiled_2d[nn] - p[None, :]
                     dist_all = np.linalg.norm(vecs_all, axis=1)
                 
-                    vecs_score = vecs_all[dist_all > 1e-8]
-                    s, score_dict = _square_score_site(vecs_score, len_tol=len_tol, ang_tol_deg=ang_tol_deg)
+                    score_mask = dist_all > 1e-8
+                    vecs_score = vecs_all[score_mask]
+                    nn_score = nn[score_mask]
+                    if preserve_visualization_data:
+                        s, score_dict, score_details = _square_score_site(
+                            vecs_score,
+                            len_tol=len_tol,
+                            ang_tol_deg=ang_tol_deg,
+                            return_details=True,
+                        )
+                    else:
+                        s, score_dict = _square_score_site(vecs_score, len_tol=len_tol, ang_tol_deg=ang_tol_deg)
+                        score_details = None
                     scores.append(s)
 
                     uv_len_err_plane = score_dict['len_err']
@@ -542,7 +643,71 @@ def find_square_net_planes(
                     uv_len_errs.append(uv_len_err_plane)
                     uv_ang_errs.append(uv_ang_err_plane)
                     u_lengths.append(u_len)
-                    v_lengths.append(v_len)                       
+                    v_lengths.append(v_len)
+
+                    if preserve_visualization_data:
+                        selected_positions = []
+                        if score_details is not None:
+                            for key in (
+                                "u_position",
+                                "v_position",
+                                "opposite_u_position",
+                                "opposite_v_position",
+                            ):
+                                pos = score_details.get(key)
+                                if pos is not None and 0 <= int(pos) < len(nn_score):
+                                    selected_positions.append(int(pos))
+                        selected_positions_unique = []
+                        seen_positions = set()
+                        for pos in selected_positions:
+                            if pos in seen_positions:
+                                continue
+                            seen_positions.add(pos)
+                            selected_positions_unique.append(pos)
+                        selected_positions = selected_positions_unique
+                        selected_tiled = [int(nn_score[pos]) for pos in selected_positions]
+                        selected_vectors = [vecs_score[pos].astype(float) for pos in selected_positions]
+                        selected_distances = [float(np.linalg.norm(vv)) for vv in selected_vectors]
+
+                        for dist_value in (u_len, v_len):
+                            if np.isfinite(dist_value):
+                                neighbor_length_measurements.append(float(dist_value))
+                        if np.isfinite(uv_ang_deg_plane):
+                            neighbor_angle_measurements.append(float(uv_ang_deg_plane))
+
+                        site_global = int(idx[si])
+                        local_detail = {
+                            "site_index": site_global,
+                            "site_local_index": int(si),
+                            "site_projected": p.astype(float),
+                            "neighbor_global_indices": tiled_global_indices[nn_score].astype(int),
+                            "neighbor_image_offsets": tiled_image_offsets[nn_score].astype(int),
+                            "neighbor_vectors": vecs_score.astype(float),
+                            "neighbor_distances": np.linalg.norm(vecs_score, axis=1).astype(float),
+                            "score": float(s),
+                            "score_info": dict(score_dict),
+                            "score_details": dict(score_details or {}),
+                            "selected_neighbor_positions": np.array(selected_positions, dtype=int),
+                            "selected_neighbor_global_indices": tiled_global_indices[selected_tiled].astype(int) if selected_tiled else np.array([], dtype=int),
+                            "selected_neighbor_image_offsets": tiled_image_offsets[selected_tiled].astype(int) if selected_tiled else np.empty((0, 3), dtype=int),
+                            "selected_neighbor_vectors": np.array(selected_vectors, dtype=float) if selected_vectors else np.empty((0, 2), dtype=float),
+                            "selected_neighbor_distances": np.array(selected_distances, dtype=float),
+                        }
+                        local_site_details.append(local_detail)
+
+                        for pos, tiled_idx in zip(selected_positions, selected_tiled):
+                            selected_neighbor_edges.append({
+                                "site_index": site_global,
+                                "site_local_index": int(si),
+                                "neighbor_index": int(tiled_global_indices[tiled_idx]),
+                                "neighbor_image_offset": tiled_image_offsets[tiled_idx].astype(int),
+                                "start": p.astype(float),
+                                "end": (p + vecs_score[pos]).astype(float),
+                                "vector": vecs_score[pos].astype(float),
+                                "distance": float(np.linalg.norm(vecs_score[pos])),
+                                "role_position": int(pos),
+                                "site_score": float(s),
+                            })
 
                 scores = np.array(scores, dtype=float)
 
@@ -788,6 +953,7 @@ def find_square_net_planes(
                 # ---- (3) adjacent-layer distances (ANY species) + attribution ----
                 min_prev = float("nan")
                 prev_closest_species = None
+                prev_closest_connection = None
                 if prev_tree is not None and prev_origin is not None and prev_atom_ids is not None:
                     d_prev, j_prev = prev_tree.query(cart, k=1)
                     if np.size(d_prev):
@@ -797,9 +963,19 @@ def find_square_net_planes(
                         origin_j = int(prev_origin[tile_j])
                         global_atom = int(prev_atom_ids[origin_j])
                         prev_closest_species = str(sp_all[global_atom])
+                        prev_closest_connection = {
+                            "side": "prev",
+                            "candidate_index": int(idx[imin]),
+                            "adjacent_index": int(global_atom),
+                            "start_cartesian": cart[imin].astype(float),
+                            "end_cartesian": prev_tree.data[tile_j].astype(float),
+                            "distance": float(min_prev),
+                            "adjacent_species": prev_closest_species,
+                        }
 
                 min_next = float("nan")
                 next_closest_species = None
+                next_closest_connection = None
                 if next_tree is not None and next_origin is not None and next_atom_ids is not None:
                     d_next, j_next = next_tree.query(cart, k=1)
                     if np.size(d_next):
@@ -809,6 +985,15 @@ def find_square_net_planes(
                         origin_j = int(next_origin[tile_j])
                         global_atom = int(next_atom_ids[origin_j])
                         next_closest_species = str(sp_all[global_atom])
+                        next_closest_connection = {
+                            "side": "next",
+                            "candidate_index": int(idx[imin]),
+                            "adjacent_index": int(global_atom),
+                            "start_cartesian": cart[imin].astype(float),
+                            "end_cartesian": next_tree.data[tile_j].astype(float),
+                            "distance": float(min_next),
+                            "adjacent_species": next_closest_species,
+                        }
 
                 # ---------- (A) compute plane-center separations (prev/next) ----------
                 dfrac_prev_signed = dfrac_next_signed = float("nan")
@@ -1021,6 +1206,60 @@ def find_square_net_planes(
                 if (not return_all) and (not passes):
                     continue
 
+                visualization_data = None
+                if preserve_visualization_data:
+                    adjacent_indices_by_side: Dict[str, np.ndarray] = {}
+                    adjacent_centers_by_side: Dict[str, float] = {}
+                    if prev_id is not None:
+                        adjacent_indices_by_side["prev"] = np.array(plane_groups[prev_id], dtype=int)
+                        adjacent_centers_by_side["prev"] = float(plane_centers[prev_id])
+                    if next_id is not None:
+                        adjacent_indices_by_side["next"] = np.array(plane_groups[next_id], dtype=int)
+                        adjacent_centers_by_side["next"] = float(plane_centers[next_id])
+
+                    plane_normal = _unit(np.cross(e1, e2))
+                    plane_center_cartesian = (
+                        np.mean(cart_all[g], axis=0).astype(float)
+                        if len(g) > 0
+                        else np.full(3, float("nan"), dtype=float)
+                    )
+
+                    visualization_data = LayerVisualizationData(
+                        candidate_site_indices=np.array(idx, dtype=int),
+                        candidate_plane_indices=np.array(g, dtype=int),
+                        adjacent_plane_indices_by_side=adjacent_indices_by_side,
+                        adjacent_plane_centers_frac_by_side=adjacent_centers_by_side,
+                        plane_cartesian_basis=np.vstack([e1, e2]).astype(float),
+                        plane_normal=plane_normal.astype(float),
+                        plane_center_cartesian=plane_center_cartesian,
+                        projected_coordinates=base_2d.astype(float),
+                        tiled_projected_coordinates=tiled_2d.astype(float),
+                        tiled_origin_indices=tiled_global_indices.astype(int),
+                        tiled_image_offsets=tiled_image_offsets.astype(int),
+                        local_site_scores=scores.astype(float),
+                        local_site_pass_flags=(scores >= float(score_threshold)).astype(bool),
+                        local_site_details=local_site_details,
+                        selected_neighbor_edges=selected_neighbor_edges,
+                        adjacent_atom_connections={
+                            side: conn
+                            for side, conn in {
+                                "prev": prev_closest_connection,
+                                "next": next_closest_connection,
+                            }.items()
+                            if conn is not None
+                        },
+                        neighbor_length_measurements=np.array(neighbor_length_measurements, dtype=float),
+                        neighbor_angle_measurements=np.array(neighbor_angle_measurements, dtype=float),
+                        detector_thresholds={
+                            "plane_tol": float(plane_tol),
+                            "k_nn": float(k_nn),
+                            "len_tol": float(len_tol),
+                            "ang_tol_deg": float(ang_tol_deg),
+                            "score_threshold": float(score_threshold),
+                            "min_pass_fraction": float(min_pass_fraction),
+                        },
+                    )
+
                 results.append(
                     SquarePlaneResult(
                         axis=ax,
@@ -1106,6 +1345,8 @@ def find_square_net_planes(
 
                         cnn_out_of_plane_pair_angle_deg_mean=cnn_out_of_plane_pair_angle_deg_mean,
                         cnn_out_of_plane_pair_angle_deg_std=cnn_out_of_plane_pair_angle_deg_std,
+
+                        visualization_data=visualization_data,
 
                     )
                 )

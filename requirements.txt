@@ -1,5 +1,7 @@
 numpy
 pandas
+scipy
+matplotlib
 pymatgen
 mp-api
 scikit-learn

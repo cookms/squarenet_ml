@@ -73,6 +73,7 @@ def _find_square_net_kwargs(cfg: PipelineConfig) -> Dict[str, Any]:
         "min_pass_fraction": min_pass_fraction,
         "score_threshold": detect.score_threshold,
         "return_all": detect.return_all,
+        "preserve_visualization_data": detect.preserve_visualization_data,
         "adjacent_by": detect.adjacent_by,
         "nn_intra_min_min": detect.nn_intra_min_min,
         "nn_intra_min_max": detect.nn_intra_min_max,

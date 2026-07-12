@@ -54,6 +54,7 @@ class DetectConfig:
     min_pass_fraction: float = 0.6
     score_threshold: float = 0.5
     return_all: bool = True
+    preserve_visualization_data: bool = False
     adjacent_by: str = "atom"
 
     # Secondary pass criteria (None means ignore the bound).

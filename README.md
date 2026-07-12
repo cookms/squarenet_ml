@@ -94,6 +94,37 @@ Pipeline runs write outputs to the configured `out_dir`:
 - `processed_ids.txt`: resume/progress log.
 - Optional CIF exports when enabled in `OutputConfig`.
 
+## Visualization
+
+Static Matplotlib figures are available from `squarenet.visualization`. For
+detector-explanation plots, enable optional visualization diagnostics when
+running the detector:
+
+```python
+from pymatgen.core import Structure
+from squarenet.detect import find_square_net_planes
+from squarenet.visualization import plot_detection_summary, save_figure
+
+structure = Structure.from_file("structure.cif")
+results = find_square_net_planes(
+    structure,
+    axes=("c", "a", "b"),
+    preserve_visualization_data=True,
+    compute_crystalnn_features=False,
+    enforce_no_out_of_plane_same_species_bonds=False,
+)
+
+result = results[0]
+fig, axes = plot_detection_summary(structure, result, representative_site="worst")
+save_figure(fig, "reports/figures/square_net_detection.png", dpi=200, overwrite=True)
+```
+
+The visualization module returns Matplotlib figures without calling
+`plt.show()`, so notebook and script callers control display and saving. The
+projected-layer plots use detector-captured plane bases, projected coordinates,
+periodic image offsets, selected neighbor vectors, local scores, and failure
+reasons when `preserve_visualization_data=True`.
+
 ## Tests
 
 Run the lightweight test suite with:

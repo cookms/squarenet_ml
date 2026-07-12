@@ -58,8 +58,8 @@ def build_config(
             forbid_coplane_mixed_species=True,
             isolate_same_species_adjacent=True,
             isolate_same_species_adjacent_dist_min=2.0,
-            enforce_no_out_of_plane_same_species_bonds=False,
-            compute_crystalnn_features=False,
+            enforce_no_out_of_plane_same_species_bonds=True,
+            compute_crystalnn_features=True,
             crystalnn_weight_cutoff=0.0,
         ),
         output=OutputConfig(

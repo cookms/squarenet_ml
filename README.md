@@ -74,8 +74,13 @@ python example_run.py
 The pipeline is configured with:
 
 - `MPQueryConfig` for Materials Project API settings and query filters.
-- `PreprocessConfig` for structure conversion and supercell options.
-- `DetectConfig` for square-net detection settings.
+- `PreprocessConfig` for selecting the structure used for detection:
+  `raw`, `conventional`, or `processed`. The `processed` option applies
+  conventional-cell conversion and the configured `supercell` or
+  `sym_supercell` settings.
+- `DetectConfig` for square-net detection settings. Its primary fields map
+  directly to `find_square_net_planes()`, including geometry thresholds,
+  adjacent-plane filters, composition filters, and CrystalNN feature controls.
 - `OutputConfig` for output location, CSV/Parquet writing, and resume behavior.
 
 ## Outputs

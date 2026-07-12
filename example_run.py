@@ -12,7 +12,7 @@ from __future__ import annotations
 import os
 from typing import Optional, Tuple
 
-from squarenet.config import DetectConfig, MPQueryConfig, OutputConfig, PipelineConfig
+from squarenet.config import DetectConfig, MPQueryConfig, OutputConfig, PipelineConfig, PreprocessConfig
 
 
 def resolve_api_key() -> Optional[str]:
@@ -23,9 +23,9 @@ def resolve_api_key() -> Optional[str]:
 def build_config(
     *,
     api_key: Optional[str] = None,
-    material_ids_path: str = "mpids.txt",
+    material_ids_path: str = None, #"mpids.txt",
     out_dir: str = "squarenet_out",
-    limit: int = 10,
+    limit: int = 20,
 ) -> PipelineConfig:
     """Build the example pipeline configuration without starting a run."""
     return PipelineConfig(
@@ -34,15 +34,33 @@ def build_config(
             material_ids_path=material_ids_path,
             limit=limit,
         ),
+        preprocess=PreprocessConfig(
+            structure_source="processed",
+            to_conventional=True,
+            symprec=1e-3,
+            angle_tolerance=5.0,
+            supercell=None,
+            sym_supercell=(3, 3, 3),
+        ),
         detect=DetectConfig(
-            candidate_species=None,
+            species=None,
             axes=("c", "a", "b"),
-            plane_tol_A=0.15,
-            min_atoms_per_plane=5,
+            plane_tol=0.01,
+            k_nn=9,
             len_tol=0.10,
-            angle_tol_deg=5.0,
-            pass_tol=0.55,
-            origin_trials=8,
+            ang_tol_deg=5.0,
+            min_pass_fraction=0.55,
+            score_threshold=0.5,
+            return_all=True,
+            adjacent_by="atom",
+            nn_intra_min_max=4.0,
+            min_adj_dist_any_atom_min=2.0,
+            forbid_coplane_mixed_species=True,
+            isolate_same_species_adjacent=True,
+            isolate_same_species_adjacent_dist_min=2.0,
+            enforce_no_out_of_plane_same_species_bonds=False,
+            compute_crystalnn_features=False,
+            crystalnn_weight_cutoff=0.0,
         ),
         output=OutputConfig(
             out_dir=out_dir,

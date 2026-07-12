@@ -13,7 +13,90 @@ from .config import PipelineConfig
 from .mp_query import search_candidates, fetch_structure, load_material_ids_txt
 from .io import ensure_dir, dump_cif, update_processed_ids_log, append_tables_v2
 from .detect import find_square_net_planes
+from .preprocess import prepare_structure
 from .summarize import summarize_square_net_one_material_v2
+
+
+def _select_detection_structure(s_raw, cfg: PipelineConfig):
+    """Return prepared structures and the structure selected for detection."""
+    mode = str(getattr(cfg.preprocess, "structure_source", "raw")).lower().strip()
+    if mode == "raw":
+        return s_raw, s_raw, s_raw, s_raw, mode
+
+    s_source, s_conv, s_final = prepare_structure(
+        s_raw,
+        to_conventional=cfg.preprocess.to_conventional,
+        symprec=cfg.preprocess.symprec,
+        angle_tolerance=cfg.preprocess.angle_tolerance,
+        supercell=cfg.preprocess.supercell,
+        sym_supercell=cfg.preprocess.sym_supercell,
+    )
+
+    if mode in ("conventional", "conv"):
+        return s_source, s_conv, s_final, s_conv, "conventional"
+    if mode in ("processed", "final"):
+        return s_source, s_conv, s_final, s_final, "processed"
+
+    raise ValueError(
+        "preprocess.structure_source must be one of "
+        "'raw', 'conventional', or 'processed'."
+    )
+
+
+def _find_square_net_kwargs(cfg: PipelineConfig) -> Dict[str, Any]:
+    """Translate DetectConfig into find_square_net_planes keyword arguments."""
+    detect = cfg.detect
+
+    species = detect.species
+    if species is None:
+        species = detect.candidate_species
+
+    plane_tol = detect.plane_tol
+    if detect.plane_tol_A is not None:
+        plane_tol = detect.plane_tol_A
+
+    ang_tol_deg = detect.ang_tol_deg
+    if detect.angle_tol_deg is not None:
+        ang_tol_deg = detect.angle_tol_deg
+
+    min_pass_fraction = detect.min_pass_fraction
+    if detect.pass_tol is not None:
+        min_pass_fraction = detect.pass_tol
+
+    return {
+        "axes": tuple(detect.axes),
+        "plane_tol": plane_tol,
+        "species": tuple(species) if species is not None else None,
+        "k_nn": detect.k_nn,
+        "len_tol": detect.len_tol,
+        "ang_tol_deg": ang_tol_deg,
+        "min_pass_fraction": min_pass_fraction,
+        "score_threshold": detect.score_threshold,
+        "return_all": detect.return_all,
+        "adjacent_by": detect.adjacent_by,
+        "nn_intra_min_min": detect.nn_intra_min_min,
+        "nn_intra_min_max": detect.nn_intra_min_max,
+        "tol_ratio_any_min": detect.tol_ratio_any_min,
+        "tol_ratio_any_max": detect.tol_ratio_any_max,
+        "min_adj_dist_any_atom_min": detect.min_adj_dist_any_atom_min,
+        "min_adj_dist_any_atom_max": detect.min_adj_dist_any_atom_max,
+        "min_adj_dist_any_plane_min": detect.min_adj_dist_any_plane_min,
+        "min_adj_dist_any_plane_max": detect.min_adj_dist_any_plane_max,
+        "closest_by_plane_sep_ang_min": detect.closest_by_plane_sep_ang_min,
+        "closest_by_plane_sep_ang_max": detect.closest_by_plane_sep_ang_max,
+        "adj_same_species_by": detect.adj_same_species_by,
+        "forbid_coplane_mixed_species": detect.forbid_coplane_mixed_species,
+        "isolate_same_species_adjacent": detect.isolate_same_species_adjacent,
+        "isolate_same_species_adjacent_dist_min": detect.isolate_same_species_adjacent_dist_min,
+        "enforce_no_out_of_plane_same_species_bonds": detect.enforce_no_out_of_plane_same_species_bonds,
+        "bond_in_plane_tol": detect.bond_in_plane_tol,
+        "crystalnn_weight_cutoff": detect.crystalnn_weight_cutoff,
+        "crystalnn_kwargs": detect.crystalnn_kwargs,
+        "compute_crystalnn_features": detect.compute_crystalnn_features,
+        "guess_oxi_states_for_crystalnn": detect.guess_oxi_states_for_crystalnn,
+        "bva_kwargs": detect.bva_kwargs,
+        "bva_fallback_to_composition_guess": detect.bva_fallback_to_composition_guess,
+    }
 
 
 def _read_existing_table(out_dir: str, name: str) -> Optional[pd.DataFrame]:
@@ -216,13 +299,19 @@ def run_pipeline(cfg: "PipelineConfig") -> Tuple[pd.DataFrame, pd.DataFrame]:
             name = doc.get("formula_pretty")
 
             try:
-                s_raw = fetch_structure(mid, api_key=cfg.mp.api_key)
+                s_raw = fetch_structure(mid, api_key=cfg.mp.api_key, conventional=False)
             except Exception as e:
-                print(f"[{i}/{len(summary_docs)}] {mid} structure fetch/preprocess failed: {e}")
+                print(f"[{i}/{len(summary_docs)}] {mid} structure fetch failed: {e}")
                 continue
 
             try:
-                layer_results = find_square_net_planes(s_raw)
+                s_source, s_conv, s_final, s_detect, structure_source = _select_detection_structure(s_raw, cfg)
+            except Exception as e:
+                print(f"[{i}/{len(summary_docs)}] {mid} structure preprocess failed: {e}")
+                continue
+
+            try:
+                layer_results = find_square_net_planes(s_detect, **_find_square_net_kwargs(cfg))
                 layers_df = pd.DataFrame(layer_results)
             except Exception as e:
                 print(f"[{i}/{len(summary_docs)}] {mid} layer detection failed: {e}")
@@ -243,6 +332,7 @@ def run_pipeline(cfg: "PipelineConfig") -> Tuple[pd.DataFrame, pd.DataFrame]:
                 continue
 
             # Add selected MP summary fields to outputs
+            material_row["structure_source"] = structure_source
             for k in ["sg_number", "sg_symbol", "crystal_system", "energy_above_hull", "band_gap"]:
                 if k in doc and k not in material_row.columns:
                     material_row[k] = doc.get(k)
@@ -251,6 +341,7 @@ def run_pipeline(cfg: "PipelineConfig") -> Tuple[pd.DataFrame, pd.DataFrame]:
             if len(axis_species_rows) > 0:
                 if "formula_pretty" not in axis_species_rows.columns:
                     axis_species_rows.insert(1, "formula_pretty", name)
+                axis_species_rows["structure_source"] = structure_source
                 for k in ["sg_number", "sg_symbol", "crystal_system", "energy_above_hull", "band_gap"]:
                     if k in doc and k not in axis_species_rows.columns:
                         axis_species_rows[k] = doc.get(k)

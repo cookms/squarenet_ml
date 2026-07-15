@@ -41,6 +41,7 @@ __all__ = [
     "save_figure",
     "plot_structure_overview",
     "plot_candidate_plane_3d",
+    "plot_candidate_plane_3d_interactive",
     "plot_projected_layer",
     "select_representative_site",
     "plot_site_geometry",
@@ -809,68 +810,1562 @@ def plot_candidate_plane_3d(
     *,
     plane_window_angstrom: Optional[float] = None,
     include_adjacent_planes: bool = True,
+    include_periodic_images: bool = True,
+    periodic_image_range: int = 1,
+    periodic_images_candidate_only: bool = False,
+    show_in_plane_neighbor_lines: bool = True,
+    neighbor_cutoff_scale: float = 1.15,
     annotate_species: bool = False,
     species_style_map: Optional[Mapping[str, Mapping[str, Any]]] = None,
+    view_elev: float = 24.0,
+    view_azim: float = 35.0,
+    figsize: Tuple[float, float] = (8.2, 6.2),
     ax: Optional[Axes] = None,
 ) -> Tuple[Figure, Axes]:
-    """Isolate the candidate plane and nearby atomic environment in 3D.
+    """Plot a candidate square-net plane in a fixed oblique 3D view.
 
-    The plot shows candidate atoms, optional previous/next adjacent planes, a
-    translucent candidate-plane surface, and the plane normal. Distances are in
-    Cartesian Angstrom coordinates.
+    This static Matplotlib counterpart to
+    :func:`plot_candidate_plane_3d_interactive` displays the candidate plane,
+    optional neighboring planes, in-plane periodic images, and candidate-site
+    nearest-neighbor connections. Periodic images are generated only along the
+    two lattice vectors lying in the candidate plane, so layers are not copied
+    along the plane-normal direction.
+
+    Parameters
+    ----------
+    structure
+        Pymatgen Structure-like object.
+    result
+        Candidate-layer result returned by ``find_square_net_planes``.
+    plane_window_angstrom
+        Include central-cell atoms whose perpendicular distance from the
+        candidate plane is no greater than this value. ``None`` includes the
+        full central-cell structure.
+    include_adjacent_planes
+        Highlight detector-recorded adjacent planes in the central cell.
+    include_periodic_images
+        Repeat candidate-plane atoms using in-plane lattice translations.
+    periodic_image_range
+        Number of cells included on either side along each in-plane lattice
+        direction. ``1`` gives a 3 x 3 patch and ``2`` gives a 5 x 5 patch.
+    periodic_images_candidate_only
+        If ``True``, repeat only candidate-species atoms. If ``False``, repeat
+        all atoms recorded in the candidate plane, including coplanar species.
+    show_in_plane_neighbor_lines
+        Draw nearest-neighbor connections from central candidate sites to the
+        complete tiled candidate layer.
+    neighbor_cutoff_scale
+        Multiplicative tolerance applied to the median nearest-neighbor
+        distance when constructing displayed connections.
+    annotate_species
+        Label central candidate and coplanar sites as, for example, ``Si12``.
+    species_style_map
+        Optional species-style overrides.
+    view_elev, view_azim
+        Fixed Matplotlib camera elevation and azimuth in degrees. These replace
+        the previous axis-dependent camera selection.
+    figsize
+        Figure size used when ``ax`` is not supplied.
+    ax
+        Optional existing Matplotlib 3D axes.
+
+    Returns
+    -------
+    (fig, ax)
+        Matplotlib figure and 3D axes. The function does not call ``plt.show``.
     """
+    if plane_window_angstrom is not None and plane_window_angstrom < 0:
+        raise VisualizationError(
+            "plane_window_angstrom must be non-negative or None"
+        )
+
+    if int(periodic_image_range) < 0:
+        raise VisualizationError(
+            "periodic_image_range must be non-negative"
+        )
+
+    if float(neighbor_cutoff_scale) <= 1.0:
+        raise VisualizationError(
+            "neighbor_cutoff_scale must be greater than 1.0"
+        )
+
     ctx = _plane_context(structure, result)
-    fig, ax = _make_ax(ax, projection="3d", figsize=(6.2, 5.0))
-    cart = ctx["cart"]
-    species = ctx["species"]
+    fig, ax = _make_ax(
+        ax,
+        projection="3d",
+        figsize=figsize,
+    )
+
+    cart = np.asarray(ctx["cart"], dtype=float)
+    species = np.asarray(ctx["species"], dtype=object)
+    center = np.asarray(ctx["center"], dtype=float)
+    e1 = _unit(
+        np.asarray(ctx["basis"][0], dtype=float)
+    )
+    e2 = _unit(
+        np.asarray(ctx["basis"][1], dtype=float)
+    )
+    normal = _unit(
+        np.asarray(ctx["normal"], dtype=float)
+    )
+
+    styles = _style_map(
+        species,
+        species_style_map,
+    )
+
+    candidate_indices = np.unique(
+        np.asarray(
+            ctx["candidate_indices"],
+            dtype=int,
+        )
+    )
+
+    plane_indices = np.unique(
+        np.asarray(
+            ctx.get(
+                "plane_indices",
+                candidate_indices,
+            ),
+            dtype=int,
+        )
+    )
+
+    adjacent_by_side: Dict[str, np.ndarray] = {}
+
+    if include_adjacent_planes:
+        adjacent_by_side = {
+            str(side): np.unique(
+                np.asarray(indices, dtype=int)
+            )
+            for side, indices in ctx["adjacent"].items()
+            if len(indices)
+        }
+
+    if adjacent_by_side:
+        adjacent_indices = np.unique(
+            np.concatenate(
+                list(adjacent_by_side.values())
+            )
+        )
+    else:
+        adjacent_indices = np.array(
+            [],
+            dtype=int,
+        )
+
+    candidate_set = set(
+        candidate_indices.tolist()
+    )
+    plane_set = set(
+        plane_indices.tolist()
+    )
+    adjacent_set = set(
+        adjacent_indices.tolist()
+    )
+
+    signed_distance = (
+        cart - center
+    ) @ normal
+
+    if plane_window_angstrom is None:
+        keep = np.ones(
+            len(cart),
+            dtype=bool,
+        )
+    else:
+        keep = (
+            np.abs(signed_distance)
+            <= float(plane_window_angstrom)
+        )
+
+    forced_indices = (
+        candidate_set
+        | plane_set
+        | adjacent_set
+    )
+
+    if forced_indices:
+        keep[
+            np.fromiter(
+                forced_indices,
+                dtype=int,
+            )
+        ] = True
+
+    def atom_role(index: int) -> str:
+        if index in candidate_set:
+            return "candidate"
+
+        if index in plane_set:
+            return "coplanar"
+
+        if index in adjacent_set:
+            return "adjacent"
+
+        return "environment"
+
+    role_styles = {
+        "candidate": {
+            "size": 95,
+            "alpha": 0.98,
+            "line_width": 1.6,
+        },
+        "coplanar": {
+            "size": 62,
+            "alpha": 0.82,
+            "line_width": 1.0,
+        },
+        "adjacent": {
+            "size": 52,
+            "alpha": 0.68,
+            "line_width": 0.8,
+        },
+        "environment": {
+            "size": 28,
+            "alpha": 0.22,
+            "line_width": 0.35,
+        },
+    }
+
+    role_labels = {
+        "candidate": "candidate",
+        "coplanar": "same plane",
+        "adjacent": "adjacent plane",
+        "environment": "environment",
+    }
+
+    central_image = (
+        0,
+        0,
+        0,
+    )
+
+    periodic_translations = [
+        (
+            central_image,
+            np.zeros(3, dtype=float),
+        )
+    ]
+
+    if include_periodic_images:
+        periodic_translations = (
+            _in_plane_periodic_translations(
+                structure,
+                axis=str(ctx["axis"]),
+                image_range=int(
+                    periodic_image_range
+                ),
+            )
+        )
+
+    display_records: List[
+        Dict[str, Any]
+    ] = []
+
+    for index in np.flatnonzero(keep):
+        index = int(index)
+        role = atom_role(index)
+
+        repeat_atom = (
+            include_periodic_images
+            and role
+            in {
+                "candidate",
+                "coplanar",
+            }
+        )
+
+        if (
+            periodic_images_candidate_only
+            and role != "candidate"
+        ):
+            repeat_atom = False
+
+        if repeat_atom:
+            translations = periodic_translations
+        else:
+            translations = [
+                (
+                    central_image,
+                    np.zeros(
+                        3,
+                        dtype=float,
+                    ),
+                )
+            ]
+
+        for image, translation in translations:
+            display_records.append(
+                {
+                    "site_index": index,
+                    "species": str(
+                        species[index]
+                    ),
+                    "role": role,
+                    "image": image,
+                    "position": (
+                        cart[index]
+                        + translation
+                    ),
+                    "is_central": (
+                        image
+                        == central_image
+                    ),
+                }
+            )
+
+    # Draw central-cell atoms and periodic images separately.
+    for current_role in (
+        "environment",
+        "adjacent",
+        "coplanar",
+        "candidate",
+    ):
+        role_records = [
+            record
+            for record in display_records
+            if (
+                record["role"]
+                == current_role
+            )
+        ]
+
+        current_species = sorted(
+            {
+                record["species"]
+                for record
+                in role_records
+            }
+        )
+
+        for symbol in current_species:
+            species_records = [
+                record
+                for record
+                in role_records
+                if (
+                    record["species"]
+                    == symbol
+                )
+            ]
+
+            style = styles.get(
+                symbol,
+                {},
+            )
+
+            color = style.get(
+                "color",
+                "0.5",
+            )
+
+            marker = style.get(
+                "marker",
+                "o",
+            )
+
+            base_style = role_styles[
+                current_role
+            ]
+
+            for image_category in (
+                "central",
+                "periodic",
+            ):
+                is_periodic = (
+                    image_category
+                    == "periodic"
+                )
+
+                records = [
+                    record
+                    for record
+                    in species_records
+                    if (
+                        (
+                            not record[
+                                "is_central"
+                            ]
+                        )
+                        == is_periodic
+                    )
+                ]
+
+                if not records:
+                    continue
+
+                xyz = np.asarray(
+                    [
+                        record["position"]
+                        for record
+                        in records
+                    ],
+                    dtype=float,
+                )
+
+                size = (
+                    base_style["size"]
+                    * (
+                        0.78
+                        if is_periodic
+                        else 1.0
+                    )
+                )
+
+                alpha = (
+                    base_style["alpha"]
+                    * (
+                        0.55
+                        if is_periodic
+                        else 1.0
+                    )
+                )
+
+                linewidth = (
+                    base_style[
+                        "line_width"
+                    ]
+                    * (
+                        0.75
+                        if is_periodic
+                        else 1.0
+                    )
+                )
+
+                suffix = (
+                    " periodic"
+                    if is_periodic
+                    else ""
+                )
+
+                scatter_kwargs: Dict[
+                    str,
+                    Any,
+                ] = {
+                    "s": size,
+                    "marker": marker,
+                    "alpha": alpha,
+                    "linewidths": linewidth,
+                    "label": (
+                        f"{symbol} "
+                        f"{role_labels[current_role]}"
+                        f"{suffix}"
+                    ),
+                    "depthshade": True,
+                }
+
+                if is_periodic:
+                    scatter_kwargs.update(
+                        facecolors="none",
+                        edgecolors=[
+                            color
+                        ],
+                    )
+                else:
+                    scatter_kwargs.update(
+                        c=[color],
+                        edgecolors=(
+                            "black"
+                            if (
+                                current_role
+                                == "candidate"
+                            )
+                            else "0.3"
+                        ),
+                    )
+
+                ax.scatter(
+                    xyz[:, 0],
+                    xyz[:, 1],
+                    xyz[:, 2],
+                    **scatter_kwargs,
+                )
+
+                if (
+                    annotate_species
+                    and not is_periodic
+                    and current_role
+                    in {
+                        "candidate",
+                        "coplanar",
+                    }
+                ):
+                    for (
+                        record,
+                        point,
+                    ) in zip(
+                        records,
+                        xyz,
+                    ):
+                        ax.text(
+                            point[0],
+                            point[1],
+                            point[2],
+                            (
+                                f"{record['species']}"
+                                f"{record['site_index']}"
+                            ),
+                            fontsize=8,
+                        )
+
+    # Draw nearest-neighbor connections from central candidate
+    # sites to the complete tiled candidate layer.
+    candidate_symbol = str(
+        getattr(
+            result,
+            "species",
+            "",
+        )
+    )
+
+    tiled_candidate_records = [
+        record
+        for record in display_records
+        if (
+            record["role"]
+            == "candidate"
+            and (
+                not candidate_symbol
+                or record["species"]
+                == candidate_symbol
+            )
+        )
+    ]
+
+    nearest_distance: Optional[
+        float
+    ] = None
+
+    if (
+        show_in_plane_neighbor_lines
+        and len(
+            tiled_candidate_records
+        )
+        >= 2
+    ):
+        positions = np.asarray(
+            [
+                record["position"]
+                for record
+                in tiled_candidate_records
+            ],
+            dtype=float,
+        )
+
+        central_rows = [
+            row
+            for row, record
+            in enumerate(
+                tiled_candidate_records
+            )
+            if record["is_central"]
+        ]
+
+        nearest_distances: List[
+            float
+        ] = []
+
+        for source in central_rows:
+            distances = np.linalg.norm(
+                positions
+                - positions[source],
+                axis=1,
+            )
+
+            positive = distances[
+                distances > 1e-8
+            ]
+
+            if positive.size:
+                nearest_distances.append(
+                    float(
+                        np.min(
+                            positive
+                        )
+                    )
+                )
+
+        if nearest_distances:
+            nearest_distance = float(
+                np.median(
+                    nearest_distances
+                )
+            )
+
+            bond_cutoff = (
+                float(
+                    neighbor_cutoff_scale
+                )
+                * nearest_distance
+            )
+
+            seen_edges = set()
+
+            for source in central_rows:
+                distances = np.linalg.norm(
+                    positions
+                    - positions[source],
+                    axis=1,
+                )
+
+                targets = np.where(
+                    (
+                        distances > 1e-8
+                    )
+                    & (
+                        distances
+                        <= bond_cutoff
+                    )
+                )[0]
+
+                for target in targets:
+                    target = int(target)
+
+                    source_record = (
+                        tiled_candidate_records[
+                            source
+                        ]
+                    )
+
+                    target_record = (
+                        tiled_candidate_records[
+                            target
+                        ]
+                    )
+
+                    source_key = (
+                        int(
+                            source_record[
+                                "site_index"
+                            ]
+                        ),
+                        tuple(
+                            source_record[
+                                "image"
+                            ]
+                        ),
+                    )
+
+                    target_key = (
+                        int(
+                            target_record[
+                                "site_index"
+                            ]
+                        ),
+                        tuple(
+                            target_record[
+                                "image"
+                            ]
+                        ),
+                    )
+
+                    edge_key = tuple(
+                        sorted(
+                            (
+                                source_key,
+                                target_key,
+                            ),
+                            key=str,
+                        )
+                    )
+
+                    if (
+                        edge_key
+                        in seen_edges
+                    ):
+                        continue
+
+                    seen_edges.add(
+                        edge_key
+                    )
+
+                    p0 = positions[
+                        source
+                    ]
+
+                    p1 = positions[
+                        target
+                    ]
+
+                    ax.plot(
+                        [
+                            p0[0],
+                            p1[0],
+                        ],
+                        [
+                            p0[1],
+                            p1[1],
+                        ],
+                        [
+                            p0[2],
+                            p1[2],
+                        ],
+                        color="0.15",
+                        linewidth=1.15,
+                        alpha=0.62,
+                    )
+
+            # Empty artist for one legend entry.
+            ax.plot(
+                [],
+                [],
+                [],
+                color="0.15",
+                linewidth=1.15,
+                alpha=0.62,
+                label=(
+                    "candidate nearest "
+                    "neighbors "
+                    f"(~{nearest_distance:.2f} A)"
+                ),
+            )
+
+    # Size the translucent surface from all displayed
+    # candidate-plane atoms.
+    surface_positions = np.asarray(
+        [
+            record["position"]
+            for record
+            in display_records
+            if record["role"]
+            in {
+                "candidate",
+                "coplanar",
+            }
+        ],
+        dtype=float,
+    )
+
+    lattice_matrix = np.asarray(
+        structure.lattice.matrix,
+        dtype=float,
+    )
+
+    lattice_scale = max(
+        float(
+            np.linalg.norm(vector)
+        )
+        for vector
+        in lattice_matrix
+    )
+
+    fallback_half_width = max(
+        0.35 * lattice_scale,
+        1.0,
+    )
+
+    if surface_positions.size:
+        offsets = (
+            surface_positions
+            - center
+        )
+
+        u_coordinates = (
+            offsets @ e1
+        )
+
+        v_coordinates = (
+            offsets @ e2
+        )
+    else:
+        u_coordinates = np.array(
+            []
+        )
+
+        v_coordinates = np.array(
+            []
+        )
+
+    def padded_limits(
+        values: np.ndarray,
+    ) -> Tuple[float, float]:
+        if (
+            values.size
+            and np.ptp(values)
+            > 1e-8
+        ):
+            span = float(
+                np.ptp(values)
+            )
+
+            padding = max(
+                0.08 * span,
+                0.35,
+            )
+
+            return (
+                float(
+                    np.min(values)
+                    - padding
+                ),
+                float(
+                    np.max(values)
+                    + padding
+                ),
+            )
+
+        return (
+            -fallback_half_width,
+            fallback_half_width,
+        )
+
+    u_min, u_max = (
+        padded_limits(
+            u_coordinates
+        )
+    )
+
+    v_min, v_max = (
+        padded_limits(
+            v_coordinates
+        )
+    )
+
+    plane_corners = np.array(
+        [
+            (
+                center
+                + u_min * e1
+                + v_min * e2
+            ),
+            (
+                center
+                + u_max * e1
+                + v_min * e2
+            ),
+            (
+                center
+                + u_max * e1
+                + v_max * e2
+            ),
+            (
+                center
+                + u_min * e1
+                + v_max * e2
+            ),
+        ],
+        dtype=float,
+    )
+
+    plane_surface = (
+        Poly3DCollection(
+            [plane_corners],
+            facecolors="0.72",
+            edgecolors="0.35",
+            linewidths=0.6,
+            alpha=0.14,
+        )
+    )
+
+    ax.add_collection3d(
+        plane_surface
+    )
+
+    plane_span = max(
+        u_max - u_min,
+        v_max - v_min,
+    )
+
+    normal_length = max(
+        0.18 * plane_span,
+        1.5,
+    )
+
+    normal_tip = (
+        center
+        + normal_length
+        * normal
+    )
+
+    ax.quiver(
+        center[0],
+        center[1],
+        center[2],
+        normal[0],
+        normal[1],
+        normal[2],
+        length=normal_length,
+        color="black",
+        linewidth=1.3,
+        arrow_length_ratio=0.14,
+    )
+
+    ax.scatter(
+        [center[0]],
+        [center[1]],
+        [center[2]],
+        marker="+",
+        s=75,
+        color="black",
+        label="plane center",
+    )
+
+    if include_adjacent_planes:
+        for (
+            side,
+            indices,
+        ) in adjacent_by_side.items():
+            separation = float(
+                np.mean(
+                    (
+                        cart[indices]
+                        - center
+                    )
+                    @ normal
+                )
+            )
+
+            label_position = (
+                center
+                + separation
+                * normal
+            )
+
+            ax.text(
+                label_position[0],
+                label_position[1],
+                label_position[2],
+                (
+                    f"{side}: "
+                    f"{separation:+.2f} A"
+                ),
+                fontsize=8,
+                ha="center",
+                va="bottom",
+            )
+
+    all_display_positions = np.asarray(
+        [
+            record["position"]
+            for record
+            in display_records
+        ],
+        dtype=float,
+    )
+
+    limit_points = [
+        all_display_positions,
+        plane_corners,
+        normal_tip[None, :],
+    ]
+
+    _set_3d_equal(
+        ax,
+        np.vstack(
+            [
+                points
+                for points
+                in limit_points
+                if points.size
+            ]
+        ),
+    )
+
+    # Fixed oblique camera, independent of result.axis.
+    ax.view_init(
+        elev=float(view_elev),
+        azim=float(view_azim),
+    )
+
+    ax.set_xlabel(
+        "Cartesian x (A)"
+    )
+
+    ax.set_ylabel(
+        "Cartesian y (A)"
+    )
+
+    ax.set_zlabel(
+        "Cartesian z (A)"
+    )
+
+    status = (
+        "PASS"
+        if _result_passes(result)
+        else "FAIL"
+    )
+
+    if include_periodic_images:
+        tile_size = (
+            2
+            * int(
+                periodic_image_range
+            )
+            + 1
+        )
+    else:
+        tile_size = 1
+
+    title = (
+        f"{_formula(structure)} | "
+        f"{candidate_symbol} "
+        f"{ctx['axis']}-plane | "
+        f"{status}"
+        f"\nin-plane patch="
+        f"{tile_size}x{tile_size}, "
+        f"elev={float(view_elev):.0f} deg, "
+        f"azim={float(view_azim):.0f} deg"
+    )
+
+    ax.set_title(title)
+
+    # Deduplicate labels and place the legend outside.
+    handles, labels = (
+        ax.get_legend_handles_labels()
+    )
+
+    unique: Dict[
+        str,
+        Any,
+    ] = {}
+
+    for (
+        handle,
+        label,
+    ) in zip(
+        handles,
+        labels,
+    ):
+        if (
+            label
+            and label
+            not in unique
+        ):
+            unique[label] = handle
+
+    if unique:
+        ax.legend(
+            unique.values(),
+            unique.keys(),
+            loc="upper left",
+            bbox_to_anchor=(
+                1.02,
+                1.0,
+            ),
+            borderaxespad=0.0,
+            fontsize=8,
+        )
+
+        fig.subplots_adjust(
+            right=0.76
+        )
+
+    return fig, ax
+
+def _in_plane_periodic_translations(
+    structure: Any,
+    axis: str,
+    image_range: int,
+) -> list[tuple[tuple[int, int, int], np.ndarray]]:
+    """Return lattice translations confined to a candidate plane.
+
+    Parameters
+    ----------
+    structure
+        Pymatgen Structure-like object.
+
+    axis
+        Crystallographic axis normal to the candidate plane: ``a``, ``b``,
+        or ``c``.
+
+    image_range
+        Number of periodic cells to include in each in-plane direction.
+        For example, ``1`` returns a 3 x 3 patch.
+
+    Returns
+    -------
+    list
+        Tuples containing the integer image vector and Cartesian translation.
+    """
+    if image_range < 0:
+        raise VisualizationError(
+            "periodic_image_range must be non-negative"
+        )
+
+    axis = str(axis).lower()
+
+    if axis not in {"a", "b", "c"}:
+        raise VisualizationError(
+            f"Unsupported candidate-plane axis: {axis!r}"
+        )
+
+    lattice = np.asarray(structure.lattice.matrix, dtype=float)
+
+    # Pymatgen lattice.matrix stores a, b, and c as its rows.
+    normal_axis_index = {
+        "a": 0,
+        "b": 1,
+        "c": 2,
+    }[axis]
+
+    in_plane_axis_indices = [
+        index
+        for index in range(3)
+        if index != normal_axis_index
+    ]
+
+    first_axis, second_axis = in_plane_axis_indices
+    translations = []
+
+    for first_shift in range(-image_range, image_range + 1):
+        for second_shift in range(-image_range, image_range + 1):
+            image = [0, 0, 0]
+            image[first_axis] = first_shift
+            image[second_axis] = second_shift
+
+            image_tuple = tuple(image)
+
+            translation = (
+                first_shift * lattice[first_axis]
+                + second_shift * lattice[second_axis]
+            )
+
+            translations.append(
+                (
+                    image_tuple,
+                    np.asarray(translation, dtype=float),
+                )
+            )
+
+    return translations
+'''
+def _in_plane_periodic_translations(
+    structure: Any,
+    axis: str,
+    image_range: int,
+) -> List[Tuple[Tuple[int, int, int], np.ndarray]]:
+    """Return Cartesian lattice translations confined to a candidate plane.
+
+    ``image_range=1`` produces the central cell and its eight nearest in-plane
+    periodic images, yielding a 3 x 3 patch without duplicating layers along
+    the plane-normal crystallographic direction.
+    """
+    image_range = int(image_range)
+    if image_range < 0:
+        raise VisualizationError("periodic_image_range must be non-negative")
+
+    normal_axis = _axis_index(axis)
+    in_plane_axes = [idx for idx in range(3) if idx != normal_axis]
+    first_axis, second_axis = in_plane_axes
+    lattice = np.asarray(structure.lattice.matrix, dtype=float)
+
+    translations: List[Tuple[Tuple[int, int, int], np.ndarray]] = []
+    for first_shift in range(-image_range, image_range + 1):
+        for second_shift in range(-image_range, image_range + 1):
+            image = [0, 0, 0]
+            image[first_axis] = first_shift
+            image[second_axis] = second_shift
+            translation = (
+                first_shift * lattice[first_axis]
+                + second_shift * lattice[second_axis]
+            )
+            translations.append((tuple(image), np.asarray(translation, dtype=float)))
+    return translations
+'''
+
+def plot_candidate_plane_3d_interactive(
+    structure: Any,
+    result: Any,
+    *,
+    plane_window_angstrom: Optional[float] = None,
+    include_adjacent_planes: bool = True,
+    include_periodic_images: bool = True,
+    periodic_image_range: int = 1,
+    periodic_images_candidate_only: bool = False,
+    show_in_plane_neighbor_lines: bool = True,
+    neighbor_cutoff_scale: float = 1.15,
+    annotate_species: bool = False,
+    species_style_map: Optional[Mapping[str, Mapping[str, Any]]] = None,
+    width: int = 1000,
+    height: int = 700,
+) -> Any:
+    """Return an interactive Plotly view of a candidate square-net plane.
+
+    Candidate-plane atoms can be repeated only along the two lattice vectors
+    lying in the detector plane. With the default ``periodic_image_range=1``,
+    the plot contains a 3 x 3 in-plane patch, making square connectivity across
+    unit-cell boundaries visible while avoiding repeated out-of-plane layers.
+
+    Parameters
+    ----------
+    structure
+        Pymatgen Structure-like object.
+    result
+        Candidate-layer result returned by ``find_square_net_planes``.
+    plane_window_angstrom
+        Include central-cell atoms whose perpendicular distance from the
+        candidate plane is no greater than this value. ``None`` includes the
+        full central-cell structure.
+    include_adjacent_planes
+        Highlight detector-recorded adjacent planes in the central cell.
+    include_periodic_images
+        Repeat candidate-plane atoms using in-plane lattice translations.
+    periodic_image_range
+        Number of cells to include on either side along each in-plane lattice
+        direction. ``1`` gives a 3 x 3 patch and ``2`` gives a 5 x 5 patch.
+    periodic_images_candidate_only
+        If ``True``, repeat only atoms of the candidate species. If ``False``,
+        repeat all atoms recorded in the candidate plane, including coplanar
+        atoms of other species.
+    show_in_plane_neighbor_lines
+        Draw nearest-neighbor connections from central candidate sites to the
+        complete tiled candidate layer.
+    neighbor_cutoff_scale
+        Multiplicative tolerance applied to the median nearest-neighbor
+        distance when constructing the displayed connection graph.
+    annotate_species
+        Label central candidate and coplanar atoms as, for example, ``Si12``.
+    species_style_map
+        Optional species-style overrides using the same format as the static
+        Matplotlib visualization functions.
+    width, height
+        Figure dimensions in pixels.
+
+    Returns
+    -------
+    plotly.graph_objects.Figure
+        Interactive three-dimensional Plotly figure for Jupyter notebooks.
+    """
+    try:
+        import plotly.graph_objects as go
+        from matplotlib.colors import to_hex
+    except ImportError as exc:
+        raise ImportError(
+            "Interactive plotting requires Plotly. Install it with "
+            "`python -m pip install plotly`."
+        ) from exc
+
+    if plane_window_angstrom is not None and plane_window_angstrom < 0:
+        raise VisualizationError("plane_window_angstrom must be non-negative or None")
+    if int(periodic_image_range) < 0:
+        raise VisualizationError("periodic_image_range must be non-negative")
+    if float(neighbor_cutoff_scale) <= 1.0:
+        raise VisualizationError("neighbor_cutoff_scale must be greater than 1.0")
+
+    ctx = _plane_context(structure, result)
+    cart = np.asarray(ctx["cart"], dtype=float)
+    species = np.asarray(ctx["species"], dtype=object)
+    center = np.asarray(ctx["center"], dtype=float)
+    e1 = _unit(np.asarray(ctx["basis"][0], dtype=float))
+    e2 = _unit(np.asarray(ctx["basis"][1], dtype=float))
+    normal = _unit(np.asarray(ctx["normal"], dtype=float))
     styles = _style_map(species, species_style_map)
 
-    candidate_set = set(ctx["candidate_indices"].tolist())
-    adjacent_indices = np.concatenate(list(ctx["adjacent"].values())) if include_adjacent_planes and ctx["adjacent"] else np.array([], dtype=int)
-    adjacent_set = set(adjacent_indices.tolist())
+    candidate_indices = np.unique(np.asarray(ctx["candidate_indices"], dtype=int))
+    plane_indices = np.unique(
+        np.asarray(ctx.get("plane_indices", candidate_indices), dtype=int)
+    )
 
-    signed = (cart - ctx["center"]) @ ctx["normal"]
+    adjacent_by_side: Dict[str, np.ndarray] = {}
+    if include_adjacent_planes:
+        adjacent_by_side = {
+            str(side): np.unique(np.asarray(indices, dtype=int))
+            for side, indices in ctx["adjacent"].items()
+            if len(indices)
+        }
+
+    if adjacent_by_side:
+        adjacent_indices = np.unique(np.concatenate(list(adjacent_by_side.values())))
+    else:
+        adjacent_indices = np.array([], dtype=int)
+
+    candidate_set = set(candidate_indices.tolist())
+    plane_set = set(plane_indices.tolist())
+    adjacent_set = set(adjacent_indices.tolist())
+    signed_distance = (cart - center) @ normal
+
     if plane_window_angstrom is None:
         keep = np.ones(len(cart), dtype=bool)
     else:
-        keep = np.abs(signed) <= float(plane_window_angstrom)
-        keep[list(candidate_set | adjacent_set)] = True
+        keep = np.abs(signed_distance) <= float(plane_window_angstrom)
 
-    _scatter_species_3d(
-        ax,
-        cart[keep],
-        species[keep],
-        styles,
-        indices=np.arange(len(cart), dtype=int)[keep],
-        candidate_set=candidate_set,
-        adjacent_set=adjacent_set,
-        show_labels=annotate_species,
+    forced_indices = candidate_set | plane_set | adjacent_set
+    if forced_indices:
+        keep[np.fromiter(forced_indices, dtype=int)] = True
+
+    def atom_role(index: int) -> str:
+        if index in candidate_set:
+            return "candidate"
+        if index in plane_set:
+            return "coplanar"
+        if index in adjacent_set:
+            return "adjacent"
+        return "environment"
+
+    role_styles = {
+        "candidate": {"size": 11, "symbol": "circle", "opacity": 1.00, "line_width": 2.0},
+        "coplanar": {"size": 8, "symbol": "diamond", "opacity": 0.85, "line_width": 1.2},
+        "adjacent": {"size": 8, "symbol": "square", "opacity": 0.75, "line_width": 1.0},
+        "environment": {"size": 5, "symbol": "circle", "opacity": 0.25, "line_width": 0.4},
+    }
+    role_labels = {
+        "candidate": "candidate",
+        "coplanar": "same plane",
+        "adjacent": "adjacent plane",
+        "environment": "environment",
+    }
+
+    central_image = (0, 0, 0)
+    periodic_translations = [(central_image, np.zeros(3, dtype=float))]
+    if include_periodic_images:
+        periodic_translations = _in_plane_periodic_translations(
+            structure, axis=str(ctx["axis"]), image_range=int(periodic_image_range)
+        )
+
+    display_records: List[Dict[str, Any]] = []
+    for index in np.flatnonzero(keep):
+        index = int(index)
+        role = atom_role(index)
+        repeat_atom = include_periodic_images and role in {"candidate", "coplanar"}
+        if periodic_images_candidate_only and role != "candidate":
+            repeat_atom = False
+        translations = periodic_translations if repeat_atom else [
+            (central_image, np.zeros(3, dtype=float))
+        ]
+        for image, translation in translations:
+            display_records.append(
+                {
+                    "site_index": index,
+                    "species": str(species[index]),
+                    "role": role,
+                    "image": image,
+                    "position": cart[index] + translation,
+                    "plane_distance": float(signed_distance[index]),
+                    "is_central": image == central_image,
+                }
+            )
+
+    fig = go.Figure()
+    for current_role in ("environment", "adjacent", "coplanar", "candidate"):
+        role_records = [r for r in display_records if r["role"] == current_role]
+        for symbol in sorted({r["species"] for r in role_records}):
+            species_records = [r for r in role_records if r["species"] == symbol]
+            for image_category in ("central", "periodic"):
+                is_periodic = image_category == "periodic"
+                records = [r for r in species_records if r["is_central"] != is_periodic]
+                if not records:
+                    continue
+
+                xyz = np.asarray([r["position"] for r in records], dtype=float)
+                style = role_styles[current_role]
+                color_value = styles.get(symbol, {}).get("color", "0.5")
+                try:
+                    plotly_color = to_hex(color_value)
+                except (TypeError, ValueError):
+                    plotly_color = str(color_value)
+
+                marker_size = style["size"] - (1 if is_periodic else 0)
+                marker_opacity = style["opacity"] * (0.65 if is_periodic else 1.0)
+                line_width = style["line_width"] * (0.7 if is_periodic else 1.0)
+                mode = "markers"
+                labels = None
+                if annotate_species and current_role in {"candidate", "coplanar"} and not is_periodic:
+                    labels = [f"{r['species']}{r['site_index']}" for r in records]
+                    mode = "markers+text"
+
+                customdata = np.empty((len(records), 8), dtype=object)
+                for row, record in enumerate(records):
+                    image = record["image"]
+                    customdata[row] = [
+                        record["site_index"], record["species"], role_labels[current_role],
+                        record["plane_distance"], image[0], image[1], image[2],
+                        "central cell" if record["is_central"] else "periodic image",
+                    ]
+
+                suffix = " (periodic)" if is_periodic else ""
+                fig.add_trace(
+                    go.Scatter3d(
+                        x=xyz[:, 0], y=xyz[:, 1], z=xyz[:, 2], mode=mode,
+                        text=labels, textposition="top center", textfont=dict(size=10),
+                        name=f"{symbol} — {role_labels[current_role]}{suffix}",
+                        legendgroup=f"{symbol}-{current_role}-{image_category}",
+                        customdata=customdata,
+                        hovertemplate=(
+                            "<b>%{customdata[1]}</b><br>"
+                            "site index: %{customdata[0]}<br>"
+                            "role: %{customdata[2]}<br>"
+                            "cell type: %{customdata[7]}<br>"
+                            "image: (%{customdata[4]}, %{customdata[5]}, %{customdata[6]})<br>"
+                            "x: %{x:.3f} Å<br>y: %{y:.3f} Å<br>z: %{z:.3f} Å<br>"
+                            "distance from plane: %{customdata[3]:+.3f} Å<extra></extra>"
+                        ),
+                        marker=dict(
+                            size=max(marker_size, 3), symbol=style["symbol"],
+                            color=plotly_color, opacity=marker_opacity,
+                            line=dict(color="black", width=line_width),
+                        ),
+                    )
+                )
+
+    candidate_symbol = str(getattr(result, "species", ""))
+    tiled_candidate_records = [
+        r for r in display_records
+        if r["role"] == "candidate" and (not candidate_symbol or r["species"] == candidate_symbol)
+    ]
+
+    if show_in_plane_neighbor_lines and len(tiled_candidate_records) >= 2:
+        positions = np.asarray([r["position"] for r in tiled_candidate_records], dtype=float)
+        central_rows = [i for i, r in enumerate(tiled_candidate_records) if r["is_central"]]
+        nearest_distances: List[float] = []
+        for source in central_rows:
+            distances = np.linalg.norm(positions - positions[source], axis=1)
+            positive = distances[distances > 1e-8]
+            if positive.size:
+                nearest_distances.append(float(np.min(positive)))
+
+        if nearest_distances:
+            nearest_distance = float(np.median(nearest_distances))
+            bond_cutoff = float(neighbor_cutoff_scale) * nearest_distance
+            line_x: List[Optional[float]] = []
+            line_y: List[Optional[float]] = []
+            line_z: List[Optional[float]] = []
+            seen_edges = set()
+
+            for source in central_rows:
+                distances = np.linalg.norm(positions - positions[source], axis=1)
+                targets = np.where((distances > 1e-8) & (distances <= bond_cutoff))[0]
+                for target in targets:
+                    source_record = tiled_candidate_records[source]
+                    target_record = tiled_candidate_records[int(target)]
+                    source_key = (int(source_record["site_index"]), tuple(source_record["image"]))
+                    target_key = (int(target_record["site_index"]), tuple(target_record["image"]))
+                    edge_key = tuple(sorted((source_key, target_key), key=str))
+                    if edge_key in seen_edges:
+                        continue
+                    seen_edges.add(edge_key)
+                    p0, p1 = positions[source], positions[int(target)]
+                    line_x.extend([float(p0[0]), float(p1[0]), None])
+                    line_y.extend([float(p0[1]), float(p1[1]), None])
+                    line_z.extend([float(p0[2]), float(p1[2]), None])
+
+            if line_x:
+                fig.add_trace(
+                    go.Scatter3d(
+                        x=line_x, y=line_y, z=line_z, mode="lines",
+                        line=dict(color="rgba(40,40,40,0.55)", width=4),
+                        name=f"candidate nearest neighbors (~{nearest_distance:.2f} Å)",
+                        hoverinfo="skip",
+                    )
+                )
+
+    surface_positions = np.asarray(
+        [r["position"] for r in display_records if r["role"] in {"candidate", "coplanar"}],
+        dtype=float,
+    )
+    if surface_positions.size:
+        offsets = surface_positions - center
+        u_coordinates = offsets @ e1
+        v_coordinates = offsets @ e2
+    else:
+        u_coordinates = np.array([])
+        v_coordinates = np.array([])
+
+    lattice_matrix = np.asarray(structure.lattice.matrix, dtype=float)
+    lattice_scale = max(float(np.linalg.norm(vector)) for vector in lattice_matrix)
+    fallback_half_width = max(0.35 * lattice_scale, 1.0)
+
+    def padded_limits(values: np.ndarray) -> Tuple[float, float]:
+        if values.size and np.ptp(values) > 1e-8:
+            span = float(np.ptp(values))
+            padding = max(0.08 * span, 0.35)
+            return float(np.min(values) - padding), float(np.max(values) + padding)
+        return -fallback_half_width, fallback_half_width
+
+    u_min, u_max = padded_limits(u_coordinates)
+    v_min, v_max = padded_limits(v_coordinates)
+    plane_corners = np.array([
+        center + u_min * e1 + v_min * e2,
+        center + u_max * e1 + v_min * e2,
+        center + u_max * e1 + v_max * e2,
+        center + u_min * e1 + v_max * e2,
+    ])
+    fig.add_trace(
+        go.Mesh3d(
+            x=plane_corners[:, 0], y=plane_corners[:, 1], z=plane_corners[:, 2],
+            i=[0, 0], j=[1, 2], k=[2, 3], color="gray", opacity=0.14,
+            flatshading=True, name="candidate plane", hoverinfo="skip",
+        )
     )
 
-    scale = max(float(np.linalg.norm(np.asarray(structure.lattice.matrix)[i])) for i in range(3)) * 0.42
-    _plot_plane_surface(ax, ctx["center"], ctx["basis"][0], ctx["basis"][1], scale)
-    c = ctx["center"]
-    n = ctx["normal"]
-    ax.quiver(c[0], c[1], c[2], n[0], n[1], n[2], length=scale * 0.55, color="black", linewidth=1.3)
-    ax.scatter([c[0]], [c[1]], [c[2]], marker="+", s=70, color="black", label="plane center")
+    plane_span = max(u_max - u_min, v_max - v_min)
+    normal_length = max(0.18 * plane_span, 1.5)
+    normal_tip = center + normal_length * normal
+    fig.add_trace(
+        go.Scatter3d(
+            x=[center[0], normal_tip[0]], y=[center[1], normal_tip[1]],
+            z=[center[2], normal_tip[2]], mode="lines",
+            line=dict(color="black", width=6), name=f"{ctx['axis']}-plane normal",
+            hoverinfo="skip",
+        )
+    )
+    fig.add_trace(
+        go.Cone(
+            x=[normal_tip[0]], y=[normal_tip[1]], z=[normal_tip[2]],
+            u=[normal[0]], v=[normal[1]], w=[normal[2]], anchor="tip",
+            sizemode="absolute", sizeref=max(0.18 * normal_length, 0.25),
+            colorscale=[[0.0, "black"], [1.0, "black"]], showscale=False,
+            showlegend=False, hoverinfo="skip",
+        )
+    )
+    fig.add_trace(
+        go.Scatter3d(
+            x=[center[0]], y=[center[1]], z=[center[2]], mode="markers",
+            marker=dict(size=6, symbol="cross", color="black"), name="plane center",
+            hovertemplate=(
+                "plane center<br>x: %{x:.3f} Å<br>y: %{y:.3f} Å<br>"
+                "z: %{z:.3f} Å<extra></extra>"
+            ),
+        )
+    )
 
-    if include_adjacent_planes:
-        for side, ids in ctx["adjacent"].items():
-            if len(ids) == 0:
-                continue
-            sep = float(np.mean((cart[ids] - c) @ n))
-            plane_center = c + sep * n
-            ax.text(plane_center[0], plane_center[1], plane_center[2], f"{side} {sep:+.2f} A", fontsize=8)
+    annotations = []
+    for side, indices in adjacent_by_side.items():
+        separation = float(np.mean((cart[indices] - center) @ normal))
+        label_position = center + separation * normal
+        annotations.append(
+            dict(
+                x=float(label_position[0]), y=float(label_position[1]),
+                z=float(label_position[2]), text=f"{side}: {separation:+.2f} Å",
+                showarrow=False, font=dict(size=11),
+                bgcolor="rgba(255,255,255,0.75)",
+                bordercolor="rgba(80,80,80,0.4)", borderwidth=1,
+            )
+        )
 
-    _set_3d_equal(ax, cart[keep])
-    _apply_axis_view(ax, "auto", axis=ctx["axis"])
-    ax.set_xlabel("Cartesian x (A)")
-    ax.set_ylabel("Cartesian y (A)")
-    ax.set_zlabel("Cartesian z (A)")
-    ax.set_title(f"{_formula(structure)} {getattr(result, 'species', '')} candidate plane".strip())
-    ax.legend(loc="best", fontsize=8)
-    return fig, ax
+    camera_direction = _unit(1.25 * e1 + 1.00 * e2 + 0.85 * normal)
+    camera_eye = 2.15 * camera_direction
+    status = "PASS" if _result_passes(result) else "FAIL"
+    formula = _formula(structure)
+    mean_score = float(getattr(result, "mean_score", np.nan))
+    pass_fraction = float(getattr(result, "pass_fraction", np.nan))
+    tile_size = 2 * int(periodic_image_range) + 1 if include_periodic_images else 1
+    title = (
+        f"{formula} | {candidate_symbol} {ctx['axis']}-plane | {status}"
+        f"<br><sup>mean score={mean_score:.3g}, pass fraction={pass_fraction:.3g}; "
+        f"in-plane patch={tile_size}×{tile_size}</sup>"
+    )
 
+    fig.update_layout(
+        title=dict(text=title, x=0.02), width=int(width), height=int(height),
+        margin=dict(l=0, r=250, b=0, t=80),
+        legend=dict(
+            x=1.02, y=1.0, xanchor="left", yanchor="top",
+            bgcolor="rgba(255,255,255,0.80)",
+            bordercolor="rgba(80,80,80,0.35)", borderwidth=1,
+            groupclick="togglegroup",
+        ),
+        scene=dict(
+            xaxis_title="Cartesian x (Å)", yaxis_title="Cartesian y (Å)",
+            zaxis_title="Cartesian z (Å)", aspectmode="data",
+            annotations=annotations,
+            camera=dict(eye=dict(
+                x=float(camera_eye[0]), y=float(camera_eye[1]), z=float(camera_eye[2])
+            )),
+        ),
+        hoverlabel=dict(namelength=-1),
+    )
+    return fig
 
 def select_representative_site(result: Any, strategy: str = "median") -> int:
     """Select a candidate site index by local score.

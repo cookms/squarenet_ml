@@ -228,12 +228,23 @@ def _style_map(species: Iterable[str], override: Optional[Mapping[str, Mapping[s
     return styles
 
 
-def _make_ax(ax: Optional[Axes], *, projection: Optional[str] = None, figsize: Tuple[float, float] = (6.0, 4.5)) -> Tuple[Figure, Axes]:
+def _make_ax(
+    ax: Optional[Axes],
+    *,
+    projection: Optional[str] = None,
+    figsize: Tuple[float, float] = (8.0, 6.0),
+) -> Tuple[Figure, Axes]:
     if ax is not None:
         return ax.figure, ax
-    fig = plt.figure(figsize=figsize)
+
+    fig = plt.figure(
+        figsize=figsize,
+        layout="constrained",
+    )
+
     if projection == "3d":
         return fig, fig.add_subplot(111, projection="3d")
+
     return fig, fig.add_subplot(111)
 
 
@@ -499,7 +510,7 @@ def plot_structure_overview(
     ax.set_ylabel("Cartesian y (A)")
     ax.set_zlabel("Cartesian z (A)")
     ax.set_title(f"{_formula(structure)} structure overview".strip())
-    ax.legend(loc="best", fontsize=8)
+    ax.legend(loc="best", fontsize=10)
     return fig, ax
 
 
@@ -756,9 +767,17 @@ def plot_projected_layer(
     title_parts = [p for p in [formula, f"{candidate_species} {data['axis']}-plane", status] if p]
     ax.set_title(
         " | ".join(title_parts)
-        + f"\nmean score={float(getattr(result, 'mean_score', np.nan)):.3g}, pass fraction={float(getattr(result, 'pass_fraction', np.nan)):.3g}"
+        + f"\nmean score={float(getattr(result, 'mean_score', np.nan)):.3g}, pass fraction={float(getattr(result, 'pass_fraction', np.nan)):.3g}",
+        pad=25
     )
-    ax.legend(loc="best", fontsize=8)
+    ax.legend(
+    loc="upper left",
+    bbox_to_anchor=(1.02, 1.0),
+    fontsize=10,
+    borderaxespad=0,
+    )
+
+    fig.subplots_adjust(right=0.76)
     return fig, ax
 
 
@@ -1844,7 +1863,7 @@ def plot_candidate_plane_3d(
                 1.0,
             ),
             borderaxespad=0.0,
-            fontsize=8,
+            fontsize=10,
         )
 
         fig.subplots_adjust(
@@ -1929,40 +1948,7 @@ def _in_plane_periodic_translations(
             )
 
     return translations
-'''
-def _in_plane_periodic_translations(
-    structure: Any,
-    axis: str,
-    image_range: int,
-) -> List[Tuple[Tuple[int, int, int], np.ndarray]]:
-    """Return Cartesian lattice translations confined to a candidate plane.
 
-    ``image_range=1`` produces the central cell and its eight nearest in-plane
-    periodic images, yielding a 3 x 3 patch without duplicating layers along
-    the plane-normal crystallographic direction.
-    """
-    image_range = int(image_range)
-    if image_range < 0:
-        raise VisualizationError("periodic_image_range must be non-negative")
-
-    normal_axis = _axis_index(axis)
-    in_plane_axes = [idx for idx in range(3) if idx != normal_axis]
-    first_axis, second_axis = in_plane_axes
-    lattice = np.asarray(structure.lattice.matrix, dtype=float)
-
-    translations: List[Tuple[Tuple[int, int, int], np.ndarray]] = []
-    for first_shift in range(-image_range, image_range + 1):
-        for second_shift in range(-image_range, image_range + 1):
-            image = [0, 0, 0]
-            image[first_axis] = first_shift
-            image[second_axis] = second_shift
-            translation = (
-                first_shift * lattice[first_axis]
-                + second_shift * lattice[second_axis]
-            )
-            translations.append((tuple(image), np.asarray(translation, dtype=float)))
-    return translations
-'''
 
 def plot_candidate_plane_3d_interactive(
     structure: Any,
@@ -2506,79 +2492,451 @@ def _finite_float(value: Any) -> Optional[float]:
 def plot_score_components(
     result: Any,
     *,
-    include_thresholds: bool = True,
+    settings: Optional[Mapping[str, Any]] = None,
+    include_diagnostics: bool = True,
     ax: Optional[Axes] = None,
 ) -> Tuple[Figure, Axes]:
-    """Plot normalized pass margins for the detector decision.
+    """Plot the criteria that actually determine ``passes`` and ``passes2``.
 
-    Normalized pass margin is defined so values greater than or equal to 1 meet
-    that criterion. For error criteria, the margin is ``threshold / measured``;
-    for score/fraction criteria, it is ``measured / threshold``.
+    Quantitative criteria are represented as normalized margins:
+
+        - lower-bound criterion: measured / lower_bound
+        - upper-bound criterion: upper_bound / measured
+
+    A normalized margin >= 1 satisfies the criterion.
+
+    Boolean criteria are shown as pass/fail statuses and are not assigned an
+    artificial numerical margin.
+
+    Parameters
+    ----------
+    result
+        A SquarePlaneResult-like object.
+    settings
+        Detector settings used to produce the result. This is needed for
+        passes2 thresholds that are not stored directly on the result.
+    include_diagnostics
+        Add non-decision quantities such as mean score and mean geometric
+        errors in a text box.
+    ax
+        Optional Matplotlib axis.
     """
-    fig, ax = _make_ax(ax, figsize=(6.2, 4.4))
-    thresholds = _thresholds(result)
-    rows: List[Tuple[str, float, bool, str]] = []
+    fig, ax = _make_ax(ax, figsize=(8.0, 5.2))
 
-    pf = _finite_float(getattr(result, "pass_fraction", np.nan))
-    mpf = thresholds.get("min_pass_fraction", None)
-    if pf is not None and mpf:
-        margin = pf / float(mpf)
-        rows.append(("site pass fraction", margin, margin >= 1.0, f"{pf:.3g} / {float(mpf):.3g}"))
+    settings = dict(settings or {})
+    stored_thresholds = _thresholds(result)
 
-    ms = _finite_float(getattr(result, "mean_score", np.nan))
-    st = thresholds.get("score_threshold", None)
-    if ms is not None and st:
-        margin = ms / float(st)
-        rows.append(("mean local score", margin, margin >= 1.0, f"{ms:.3g} / {float(st):.3g}"))
+    # Prefer explicitly supplied settings, then fall back to thresholds stored
+    # with the visualization data.
+    def threshold(name: str, default: Any = None) -> Any:
+        if name in settings:
+            return settings[name]
+        return stored_thresholds.get(name, default)
 
-    le = _finite_float(getattr(result, "uv_len_err_mean", np.nan))
-    lt = thresholds.get("len_tol", None)
-    if le is not None and lt:
-        margin = float("inf") if le <= 1e-12 else float(lt) / le
-        rows.append(("length error", margin, margin >= 1.0, f"{le:.3g} <= {float(lt):.3g}"))
+    quantitative_rows: List[Dict[str, Any]] = []
+    boolean_rows: List[Dict[str, Any]] = []
 
-    ae = _finite_float(getattr(result, "uv_ang_err_mean", np.nan))
-    at = thresholds.get("ang_tol_deg", None)
-    if ae is not None and at:
-        margin = float("inf") if ae <= 1e-12 else float(at) / ae
-        rows.append(("angle error", margin, margin >= 1.0, f"{ae:.3g} <= {float(at):.3g} deg"))
+    def add_lower_bound(
+        label: str,
+        measured: Any,
+        lower: Any,
+        *,
+        units: str = "",
+    ) -> None:
+        value = _finite_float(measured)
+        bound = _finite_float(lower)
 
-    oop = bool(getattr(result, "has_out_of_plane_same_species_bond", False))
-    if hasattr(result, "has_out_of_plane_same_species_bond"):
-        rows.append(("no same-species out-of-plane bond", 0.0 if oop else 1.2, not oop, "yes" if not oop else "no"))
+        if bound is None:
+            return
 
-    mixed = bool(getattr(result, "has_coplane_other_species", False))
-    if hasattr(result, "has_coplane_other_species"):
-        rows.append(("coplanar composition rule", 0.0 if mixed else 1.2, not mixed, "pure" if not mixed else "mixed"))
+        if value is None:
+            quantitative_rows.append(
+                {
+                    "label": label,
+                    "margin": 0.0,
+                    "passed": False,
+                    "text": f"missing; required ≥ {bound:g}{units}",
+                }
+            )
+            return
 
-    if not rows:
-        ax.text(0.5, 0.5, "No score component diagnostics available", ha="center", va="center", transform=ax.transAxes)
+        if bound <= 0:
+            return
+
+        margin = value / bound
+        quantitative_rows.append(
+            {
+                "label": label,
+                "margin": margin,
+                "passed": value >= bound,
+                "text": f"{value:.3g}{units} ≥ {bound:.3g}{units}",
+            }
+        )
+
+    def add_upper_bound(
+        label: str,
+        measured: Any,
+        upper: Any,
+        *,
+        units: str = "",
+    ) -> None:
+        value = _finite_float(measured)
+        bound = _finite_float(upper)
+
+        if bound is None:
+            return
+
+        if value is None:
+            quantitative_rows.append(
+                {
+                    "label": label,
+                    "margin": 0.0,
+                    "passed": False,
+                    "text": f"missing; required ≤ {bound:g}{units}",
+                }
+            )
+            return
+
+        if value <= 1e-12:
+            margin = np.inf
+        else:
+            margin = bound / value
+
+        quantitative_rows.append(
+            {
+                "label": label,
+                "margin": margin,
+                "passed": value <= bound,
+                "text": f"{value:.3g}{units} ≤ {bound:.3g}{units}",
+            }
+        )
+
+    def add_boolean(label: str, passed: bool, text: str) -> None:
+        boolean_rows.append(
+            {
+                "label": label,
+                "passed": bool(passed),
+                "text": text,
+            }
+        )
+
+    # ------------------------------------------------------------------
+    # Actual primary-pass criterion
+    # ------------------------------------------------------------------
+    add_lower_bound(
+        "sites meeting local-score threshold",
+        getattr(result, "pass_fraction", np.nan),
+        threshold("min_pass_fraction", 0.6),
+    )
+
+    # ------------------------------------------------------------------
+    # Actual passes2 numeric criteria
+    # ------------------------------------------------------------------
+    add_lower_bound(
+        "minimum adjacent-atom clearance",
+        getattr(result, "min_adj_dist_any_atom", np.nan),
+        threshold("min_adj_dist_any_atom_min", 2.0),
+        units=" Å",
+    )
+
+    add_upper_bound(
+        "shortest in-plane same-species spacing",
+        getattr(result, "nn_intra_min", np.nan),
+        threshold("nn_intra_min_max", 4.0),
+        units=" Å",
+    )
+
+    # Add optional bounds only when enabled.
+    add_lower_bound(
+        "in-plane / adjacent-distance ratio",
+        getattr(result, "tol_ratio_any", np.nan),
+        threshold("tol_ratio_any_min", None),
+    )
+    add_upper_bound(
+        "in-plane / adjacent-distance ratio",
+        getattr(result, "tol_ratio_any", np.nan),
+        threshold("tol_ratio_any_max", None),
+    )
+
+    add_lower_bound(
+        "plane-selected adjacent distance",
+        getattr(result, "min_adj_dist_any_plane", np.nan),
+        threshold("min_adj_dist_any_plane_min", None),
+        units=" Å",
+    )
+    add_upper_bound(
+        "plane-selected adjacent distance",
+        getattr(result, "min_adj_dist_any_plane", np.nan),
+        threshold("min_adj_dist_any_plane_max", None),
+        units=" Å",
+    )
+
+    add_lower_bound(
+        "nearest plane-center separation",
+        getattr(result, "closest_by_plane_sep_ang", np.nan),
+        threshold("closest_by_plane_sep_ang_min", None),
+        units=" Å",
+    )
+    add_upper_bound(
+        "nearest plane-center separation",
+        getattr(result, "closest_by_plane_sep_ang", np.nan),
+        threshold("closest_by_plane_sep_ang_max", None),
+        units=" Å",
+    )
+
+    # ------------------------------------------------------------------
+    # Actual passes2 Boolean criteria
+    # ------------------------------------------------------------------
+    primary_passed = bool(getattr(result, "passes", False))
+    add_boolean(
+        "primary square-geometry screen",
+        primary_passed,
+        "passes=True" if primary_passed else "passes=False",
+    )
+
+    forbid_mixed = threshold("forbid_coplane_mixed_species", True)
+    if forbid_mixed is not None:
+        mixed = bool(getattr(result, "has_coplane_other_species", False))
+
+        if bool(forbid_mixed):
+            add_boolean(
+                "candidate plane contains only target species",
+                not mixed,
+                "pure" if not mixed else "mixed",
+            )
+        else:
+            add_boolean(
+                "candidate plane contains multiple species",
+                mixed,
+                "mixed" if mixed else "pure",
+            )
+
+    isolate_adjacent = threshold("isolate_same_species_adjacent", True)
+    isolation_cutoff = threshold(
+        "isolate_same_species_adjacent_dist_min",
+        2.0,
+    )
+
+    if isolate_adjacent:
+        adjacent_species = getattr(
+            result,
+            "closest_by_atom_atom_species",
+            None,
+        )
+
+        # Some result classes may not retain the closest atom species directly.
+        # In that case, use the recorded failure reason when available.
+        reasons = set(getattr(result, "passes2_fail_reasons", []) or [])
+        failed_isolation = "adjacent_same_species_too_close" in reasons
+
+        if adjacent_species is not None:
+            distance = _finite_float(
+                getattr(result, "min_adj_dist_any_atom", np.nan)
+            )
+            failed_isolation = (
+                str(adjacent_species) == str(getattr(result, "species", ""))
+                and distance is not None
+                and isolation_cutoff is not None
+                and distance <= float(isolation_cutoff)
+            )
+
+        add_boolean(
+            "no same-species adjacent atom inside cutoff",
+            not failed_isolation,
+            (
+                f"clear of {float(isolation_cutoff):g} Å cutoff"
+                if not failed_isolation
+                else f"same species within {float(isolation_cutoff):g} Å"
+            ),
+        )
+
+    enforce_bond_filter = threshold(
+        "enforce_no_out_of_plane_same_species_bonds",
+        True,
+    )
+    if enforce_bond_filter:
+        oop_bond = bool(
+            getattr(
+                result,
+                "has_out_of_plane_same_species_bond",
+                False,
+            )
+        )
+        add_boolean(
+            "no out-of-plane same-species CrystalNN bond",
+            not oop_bond,
+            "none found" if not oop_bond else "bond found",
+        )
+
+    if not quantitative_rows and not boolean_rows:
+        ax.text(
+            0.5,
+            0.5,
+            "No detector decision diagnostics available",
+            ha="center",
+            va="center",
+            transform=ax.transAxes,
+        )
         ax.set_axis_off()
         return fig, ax
 
-    labels = [r[0] for r in rows]
-    margins = np.array([min(r[1], 2.5) if np.isfinite(r[1]) else 2.5 for r in rows], dtype=float)
-    passed = [r[2] for r in rows]
-    y = np.arange(len(rows), dtype=float)
-    bars = ax.barh(y, margins, color=["0.62" if ok else "0.88" for ok in passed], edgecolor="0.15", linewidth=0.9)
-    for bar, ok in zip(bars, passed):
+    # ------------------------------------------------------------------
+    # Draw quantitative margins
+    # ------------------------------------------------------------------
+    labels: List[str] = []
+    display_values: List[float] = []
+    passed_flags: List[bool] = []
+    annotations: List[str] = []
+    row_types: List[str] = []
+
+    clip_margin = 2.5
+
+    for row in quantitative_rows:
+        raw_margin = float(row["margin"])
+        display_margin = (
+            clip_margin
+            if not np.isfinite(raw_margin)
+            else min(raw_margin, clip_margin)
+        )
+
+        labels.append(row["label"])
+        display_values.append(display_margin)
+        passed_flags.append(bool(row["passed"]))
+
+        margin_label = (
+            f">{clip_margin:g}"
+            if not np.isfinite(raw_margin) or raw_margin > clip_margin
+            else f"{raw_margin:.2f}"
+        )
+        annotations.append(
+            f"{'PASS' if row['passed'] else 'FAIL'}  "
+            f"{row['text']}  [margin {margin_label}]"
+        )
+        row_types.append("quantitative")
+
+    # Boolean rows are given a fixed visual position, but the axis annotation
+    # explicitly identifies them as Boolean rather than quantitative margins.
+    for row in boolean_rows:
+        labels.append(row["label"])
+        display_values.append(1.15 if row["passed"] else 0.15)
+        passed_flags.append(bool(row["passed"]))
+        annotations.append(
+            f"{'PASS' if row['passed'] else 'FAIL'}  {row['text']}"
+        )
+        row_types.append("boolean")
+
+    y = np.arange(len(labels), dtype=float)
+
+    bars = ax.barh(
+        y,
+        display_values,
+        color=["0.62" if ok else "0.88" for ok in passed_flags],
+        edgecolor="0.15",
+        linewidth=0.9,
+    )
+
+    for bar, ok, row_type in zip(bars, passed_flags, row_types):
         if not ok:
             bar.set_hatch("//")
-    for yi, margin, ok, label in zip(y, margins, passed, [r[3] for r in rows]):
-        marker = "o" if ok else "x"
-        ax.scatter([min(margin, 2.5)], [yi], marker=marker, color="0.05", zorder=4)
-        ax.text(2.56, yi, ("PASS" if ok else "FAIL") + f"  {label}", va="center", fontsize=8)
+        if row_type == "boolean":
+            bar.set_alpha(0.55)
 
-    if include_thresholds:
-        ax.axvline(1.0, color="0.1", linestyle="--", linewidth=1.0, label="pass boundary")
+    for yi, value, ok, text, row_type in zip(
+        y,
+        display_values,
+        passed_flags,
+        annotations,
+        row_types,
+    ):
+        marker = "o" if ok else "x"
+        ax.scatter(
+            value,
+            yi,
+            marker=marker,
+            color="0.05",
+            zorder=4,
+        )
+
+        ax.text(
+            1.02,
+            yi,
+            text,
+            va="center",
+            fontsize=8,
+            transform=ax.get_yaxis_transform(),
+            clip_on=False,
+        )
+
+        if row_type == "boolean":
+            ax.text(
+                0.02,
+                yi,
+                "Boolean",
+                va="center",
+                fontsize=7,
+                transform=ax.get_yaxis_transform(),
+            )
+
+    ax.axvline(
+        1.0,
+        color="0.1",
+        linestyle="--",
+        linewidth=1.0,
+        label="quantitative pass boundary",
+    )
+
     ax.set_yticks(y)
     ax.set_yticklabels(labels)
-    ax.set_xlim(0, 3.35)
-    ax.set_xlabel("Normalized pass margin (>=1 passes)")
-    ax.set_title("Detector score components")
+    ax.set_xlim(0, clip_margin)
+    ax.set_xlabel("Normalized margin for quantitative criteria")
+    ax.set_title(
+        f"Detector decision gates: "
+        f"passes={bool(getattr(result, 'passes', False))}, "
+        f"passes2={bool(getattr(result, 'passes2', False))}"
+    )
     ax.invert_yaxis()
-    return fig, ax
 
+    # ------------------------------------------------------------------
+    # Supporting diagnostics that do not independently determine the label
+    # ------------------------------------------------------------------
+    if include_diagnostics:
+        diagnostic_lines = []
+
+        diagnostics = [
+            ("mean local score", getattr(result, "mean_score", np.nan), ""),
+            ("median local score", getattr(result, "median_score", np.nan), ""),
+            ("mean length error", getattr(result, "uv_len_err_mean", np.nan), ""),
+            ("mean angle error", getattr(result, "uv_ang_err_mean", np.nan), "°"),
+            ("mean in-plane NN", getattr(result, "nn_intra_mean", np.nan), " Å"),
+        ]
+
+        for name, raw_value, units in diagnostics:
+            value = _finite_float(raw_value)
+            if value is not None:
+                diagnostic_lines.append(f"{name}: {value:.3g}{units}")
+
+        failure_reasons = list(
+            getattr(result, "passes2_fail_reasons", []) or []
+        )
+        if failure_reasons:
+            diagnostic_lines.append(
+                "passes2 reasons: " + ", ".join(failure_reasons)
+            )
+
+        if diagnostic_lines:
+            ax.text(
+                0.0,
+                -0.16,
+                "Supporting diagnostics — not independent decision gates\n"
+                + "\n".join(diagnostic_lines),
+                transform=ax.transAxes,
+                ha="left",
+                va="top",
+                fontsize=8,
+            )
+
+    return fig, ax
+    
 
 def _measurement_values(result: Any, attr: str, fallback_attrs: Sequence[str], label: str) -> np.ndarray:
     viz = _viz(result)
@@ -2623,7 +2981,7 @@ def plot_neighbor_length_distribution(
             ax.axvspan(lo, hi, color="0.7", alpha=0.22, label=f"+/-{float(lt):.1%}")
     ax.set_xlabel("Selected neighbor length (A)")
     ax.set_title("In-plane neighbor length distribution")
-    ax.legend(loc="best", fontsize=8)
+    ax.legend(loc="best", fontsize=10)
     return fig, ax
 
 
@@ -2733,7 +3091,7 @@ def plot_adjacent_plane_environment(
     ax.set_xlabel("Projected coordinate u (A)")
     ax.set_ylabel("Plane-normal distance (A)")
     ax.set_title("Adjacent-plane environment")
-    ax.legend(loc="best", fontsize=8)
+    ax.legend(loc="best", fontsize=10)
     return fig, ax
 
 
@@ -2785,22 +3143,34 @@ def _summary_text(structure: Any, result: Any) -> str:
         f"pass fraction={float(getattr(result, 'pass_fraction', np.nan)):.3g} | failure reasons: {reason_text}"
     )
 
-
 def plot_detection_summary(
     structure: Any,
     result: Any,
     *,
     config: Optional[Any] = None,
     representative_site: Any = "worst",
+    figsize: Tuple[float, float] = (16.0, 12.0),
 ) -> Tuple[Figure, Dict[str, Axes]]:
-    """Create a four-panel diagnostic figure for one candidate layer.
+    """Create a four-panel diagnostic figure for one candidate layer."""
 
-    Panels show the 3D plane context, projected detector layer, representative
-    site geometry, and normalized score components. This is intended as the main
-    figure for positive and negative examples in notebooks.
-    """
-    fig = plt.figure(figsize=(11.0, 8.2), constrained_layout=True)
-    gs = fig.add_gridspec(2, 2)
+    fig = plt.figure(
+        figsize=figsize,
+        layout="constrained",
+    )
+
+    fig.get_layout_engine().set(
+        w_pad=0.08,
+        h_pad=0.12,
+        wspace=0.10,
+        hspace=0.18,
+    )
+
+    gs = fig.add_gridspec(
+        2,
+        2,
+        width_ratios=(1.05, 1.0),
+        height_ratios=(1.0, 1.08),
+    )
     axes: Dict[str, Axes] = {
         "plane_3d": fig.add_subplot(gs[0, 0], projection="3d"),
         "projected_layer": fig.add_subplot(gs[0, 1]),
@@ -2822,7 +3192,11 @@ def plot_detection_summary(
         axes["site_geometry"].set_axis_off()
 
     plot_score_components(result, ax=axes["score_components"])
-    fig.suptitle(_summary_text(structure, result), fontsize=11)
+    fig.suptitle(
+        _summary_text(structure, result),
+        fontsize=13,
+        y=1.025,
+    )    
     return fig, axes
 
 
@@ -2933,7 +3307,7 @@ def plot_score_distribution(layers_df: Any, group_by_pass: bool = True, ax: Opti
     ax.set_ylabel("Candidate layers")
     ax.set_title("Score distribution")
     if group_by_pass:
-        ax.legend(loc="best", fontsize=8)
+        ax.legend(loc="best", fontsize=10)
     return fig, ax
 
 

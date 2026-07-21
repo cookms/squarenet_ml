@@ -371,7 +371,7 @@ def find_square_net_planes(
 
     isolate_same_species_adjacent: Optional[bool] = True,
     # If True: passes2 fails if the closest atom in the closest adjacent plane (by atom distance)
-    #          is the same species AND greater than isolate_same_species_adjacent_dist_min (Å).
+    #          is the same species AND less than isolate_same_species_adjacent_dist_min (Å).
     # If None: ignore this criterion.
 
     isolate_same_species_adjacent_dist_min: Optional[float] = 2.0,

@@ -13,3 +13,5 @@ venv/
 .ipynb_checkpoints/
 
 squarenet_out*/
+data/axis_species.csv
+data/materials.csv

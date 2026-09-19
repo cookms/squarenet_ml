@@ -1,0 +1,28 @@
+# Copy this file, adjust the settings, then pass its path (or uploaded bytes)
+# directly to squarenet.run_pipeline(). Unspecified settings use package defaults.
+mp:
+  # Prefer the MP_API_KEY environment variable over storing a secret here.
+  material_ids:
+    - mp-149
+  limit: 10
+
+preprocess:
+  structure_source: raw
+
+detect:
+  axes: [a, b, c]
+  plane_tol: 0.01
+  score_threshold: 0.5
+  min_pass_fraction: 0.6
+  compute_crystalnn_features: true
+  enforce_no_out_of_plane_same_species_bonds: true
+
+output:
+  out_dir: squarenet_out
+  write_csv: true
+  write_parquet: true
+  resume: true
+
+meta:
+  experiment: baseline-square-net-screen
+  notes: Example YAML detector configuration

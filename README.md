@@ -71,6 +71,20 @@ IDs or search filters, then run:
 python example_run.py
 ```
 
+Alternatively, copy `detector_config.example.yaml` and pass the YAML file
+directly to the pipeline:
+
+```python
+from squarenet import run_pipeline
+
+materials_df, axis_species_df = run_pipeline("my_detector_config.yaml")
+```
+
+Uploaded YAML is supported without first saving it to disk. Pass UTF-8 bytes
+or a file-like upload object to `run_pipeline`. To inspect or adjust the parsed
+configuration before starting a run, use
+`load_pipeline_config(uploaded_file_or_bytes)`.
+
 The pipeline is configured with:
 
 - `MPQueryConfig` for Materials Project API settings and query filters.
@@ -90,7 +104,10 @@ Pipeline runs write outputs to the configured `out_dir`:
 - `materials.csv` / `materials.parquet`: one row per material.
 - `axis_species.csv` / `axis_species.parquet`: one row per material, axis, and
   species summary.
-- `meta.json`: run configuration metadata.
+- `meta.json` and `run_meta.json`: timestamped run metadata, including requested
+  and effective detector settings, preprocessing/output settings, user metadata,
+  and a stable configuration fingerprint. Materials Project API keys are
+  redacted.
 - `processed_ids.txt`: resume/progress log.
 - Optional CIF exports when enabled in `OutputConfig`.
 

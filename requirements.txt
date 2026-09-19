@@ -6,3 +6,4 @@ pymatgen
 mp-api
 scikit-learn
 pyarrow  # optional, for parquet output
+PyYAML

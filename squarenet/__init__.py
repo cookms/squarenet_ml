@@ -9,9 +9,16 @@ Core outputs:
 Design note:
 This package keeps heavy dependencies (pymatgen, mp-api) imported inside modules.
 """
-from .config import MPQueryConfig, PreprocessConfig, DetectConfig, PipelineConfig, OutputConfig
+from .config import (
+    MPQueryConfig,
+    PreprocessConfig,
+    DetectConfig,
+    PipelineConfig,
+    OutputConfig,
+    load_pipeline_config,
+)
 
-def run_pipeline(cfg: PipelineConfig):
+def run_pipeline(cfg):
     from .pipeline import run_pipeline as _run
     return _run(cfg)
 

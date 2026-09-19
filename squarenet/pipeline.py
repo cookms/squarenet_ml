@@ -3,13 +3,15 @@ from __future__ import annotations
 import os
 import json
 import uuid
-from datetime import datetime
-from typing import Tuple, List, Optional, Set, Dict, Any
+import hashlib
+from dataclasses import asdict
+from datetime import datetime, timezone
+from typing import Tuple, List, Optional, Set, Dict, Any, Union
 
 import pandas as pd
 
 
-from .config import PipelineConfig
+from .config import PipelineConfig, YamlSource, load_pipeline_config
 from .mp_query import search_candidates, fetch_structure, load_material_ids_txt
 from .io import ensure_dir, dump_cif, update_processed_ids_log, append_tables_v2
 from .detect import find_square_net_planes
@@ -152,12 +154,41 @@ def _atomic_write_json(path: str, payload: Dict[str, Any]) -> None:
     os.replace(tmp, path)
 
 
-def run_pipeline(cfg: "PipelineConfig") -> Tuple[pd.DataFrame, pd.DataFrame]:
+def _build_run_metadata(cfg: PipelineConfig) -> Dict[str, Any]:
+    """Build a safe, reproducible record of the settings used by a run."""
+    mp_settings = asdict(cfg.mp)
+    if mp_settings.get("api_key"):
+        mp_settings["api_key"] = "<redacted>"
+
+    settings = {
+        "mp_query": mp_settings,
+        "preprocess": asdict(cfg.preprocess),
+        "detector": asdict(cfg.detect),
+        "detector_effective": _find_square_net_kwargs(cfg),
+        "output": asdict(cfg.output),
+        "user_meta": dict(cfg.meta),
+    }
+    canonical = json.dumps(settings, sort_keys=True, separators=(",", ":"), default=str)
+    return {
+        "schema_version": 1,
+        "created_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "config_sha256": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+        **settings,
+    }
+
+
+def run_pipeline(cfg: Union[PipelineConfig, YamlSource]) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """Run MP query -> preprocess -> detect -> summarize.
+
+    ``cfg`` may be a ``PipelineConfig`` or a YAML path/upload accepted by
+    :func:`squarenet.config.load_pipeline_config`.
 
     Batch-writes outputs so partial progress is preserved if the run stops or errors.
     Returns (materials_out, axis_species_out) read back from disk at the end.
     """
+    if not isinstance(cfg, PipelineConfig):
+        cfg = load_pipeline_config(cfg)
+
     out_dir = cfg.output.out_dir
     ensure_dir(out_dir)
 
@@ -219,12 +250,7 @@ def run_pipeline(cfg: "PipelineConfig") -> Tuple[pd.DataFrame, pd.DataFrame]:
         if cfg.output.resume and cfg.output.skip_existing and processed_ids:
             summary_docs = [d for d in summary_docs if str(d.get("material_id")) not in processed_ids]
 
-    meta = {
-        "mp_query": cfg.mp.__dict__,
-        "preprocess": cfg.preprocess.__dict__,
-        "detect": cfg.detect.__dict__,
-        "user_meta": cfg.meta,
-    }
+    meta = _build_run_metadata(cfg)
 
     # Write meta early so it's present even if we crash later
     try:

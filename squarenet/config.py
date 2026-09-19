@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
-from typing import Optional, Sequence, List, Union, Dict, Any
+from dataclasses import fields
+from typing import Optional, Sequence, List, Union, Dict, Any, IO, Tuple
 
 
 @dataclass(frozen=True)
@@ -126,3 +128,95 @@ class PipelineConfig:
 
     # attach arbitrary metadata to stamp into outputs
     meta: Dict[str, Any] = field(default_factory=dict)
+
+
+YamlSource = Union[str, os.PathLike, bytes, bytearray, IO[str], IO[bytes]]
+
+
+def _read_yaml_source(source: YamlSource) -> Tuple[str, str]:
+    """Read YAML from a path, uploaded bytes, or a file-like object."""
+    if isinstance(source, os.PathLike):
+        source = os.fspath(source)
+
+    if isinstance(source, str):
+        with open(source, "r", encoding="utf-8") as handle:
+            return handle.read(), os.path.abspath(source)
+
+    if isinstance(source, (bytes, bytearray)):
+        return bytes(source).decode("utf-8-sig"), "<uploaded YAML>"
+
+    if hasattr(source, "read"):
+        value = source.read()
+        name = str(getattr(source, "name", "<uploaded YAML>"))
+        if isinstance(value, bytes):
+            value = value.decode("utf-8-sig")
+        if not isinstance(value, str):
+            raise TypeError("A YAML upload's read() method must return str or bytes.")
+        return value, name
+
+    raise TypeError("YAML config must be a path, bytes, or a readable file-like object.")
+
+
+def _section_from_dict(section_name: str, config_type, value: Any):
+    if value is None:
+        value = {}
+    if not isinstance(value, dict):
+        raise ValueError(f"YAML section '{section_name}' must be a mapping.")
+
+    allowed = {item.name for item in fields(config_type)}
+    unknown = sorted(set(value) - allowed)
+    if unknown:
+        raise ValueError(
+            f"Unknown setting(s) in YAML section '{section_name}': {', '.join(unknown)}"
+        )
+    try:
+        return config_type(**value)
+    except TypeError as exc:
+        raise ValueError(f"Invalid YAML section '{section_name}': {exc}") from exc
+
+
+def load_pipeline_config(source: YamlSource) -> PipelineConfig:
+    """Load a pipeline configuration from a YAML path or uploaded file.
+
+    ``source`` may be a filesystem path, UTF-8 bytes supplied by an upload
+    widget, or a text/binary file-like object. Unknown settings are rejected so
+    misspelled detector thresholds cannot silently fall back to defaults.
+    """
+    try:
+        import yaml
+    except ImportError as exc:
+        raise ImportError(
+            "YAML config loading requires PyYAML. Install it with 'pip install PyYAML'."
+        ) from exc
+
+    text, source_name = _read_yaml_source(source)
+    try:
+        payload = yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        raise ValueError(f"Could not parse YAML config {source_name}: {exc}") from exc
+
+    if payload is None:
+        payload = {}
+    if not isinstance(payload, dict):
+        raise ValueError("The YAML config root must be a mapping.")
+
+    allowed_sections = {"mp", "preprocess", "detect", "output", "meta"}
+    unknown_sections = sorted(set(payload) - allowed_sections)
+    if unknown_sections:
+        raise ValueError(f"Unknown YAML section(s): {', '.join(unknown_sections)}")
+
+    user_meta = payload.get("meta", {})
+    if user_meta is None:
+        user_meta = {}
+    if not isinstance(user_meta, dict):
+        raise ValueError("YAML section 'meta' must be a mapping.")
+
+    return PipelineConfig(
+        mp=_section_from_dict("mp", MPQueryConfig, payload.get("mp")),
+        preprocess=_section_from_dict(
+            "preprocess", PreprocessConfig, payload.get("preprocess")
+        ),
+        detect=_section_from_dict("detect", DetectConfig, payload.get("detect")),
+        output=_section_from_dict("output", OutputConfig, payload.get("output")),
+        meta=dict(user_meta),
+    )

@@ -1,0 +1,22 @@
+data:
+  run_dir: C:\Users\mscoo\GIT_projects\Squarenet_ML\data
+  materials_file: materials.csv
+  axis_species_file: axis_species.csv
+  metadata_file: meta.json
+
+validation:
+  expected_axes: [a, b, c]
+  near_hull_threshold_ev_atom: 0.10
+  duplicate_structure_match_tolerance: 0.10
+  maximum_missing_target_fraction: 0.25
+
+aggregation:
+  candidate_filter: all
+  dominant_candidate_order:
+    - passes2
+    - passes
+    - mean_score
+    - pass_fraction
+    - n_sites
+
+random_seed: 42

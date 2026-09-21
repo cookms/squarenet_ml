@@ -15,3 +15,5 @@ venv/
 squarenet_out*/
 data/axis_species.csv
 data/materials.csv
+materials_50k_raw.csv
+outputs/experiment_A

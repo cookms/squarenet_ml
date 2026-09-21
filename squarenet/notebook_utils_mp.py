@@ -68,7 +68,7 @@ def target_audit_table(data: pd.DataFrame, registry: pd.DataFrame) -> pd.DataFra
 
 def save_figure(fig: plt.Figure, name: str, figure_dir: Path | None = None) -> Path:
     if figure_dir is None:
-        from experiment_config import FIGURE_DIR
+        from .experiment_config import FIGURE_DIR
         figure_dir = FIGURE_DIR
     figure_dir.mkdir(parents=True, exist_ok=True)
     path = figure_dir / name

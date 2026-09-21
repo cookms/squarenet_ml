@@ -3,11 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import inspect
-import json
 import math
-import os
-import pickle
-from pathlib import Path
 from typing import Any, Sequence
 
 import numpy as np
@@ -42,7 +38,7 @@ except ImportError:  # Optional dependency; only required when model_name="xgboo
     XGBClassifier = None
     XGBRegressor = None
 
-from .featurization import clean_text_scalar
+from featurization import clean_text_scalar
 
 
 LOWER_IS_BETTER = {"mae", "rmse", "log_loss", "brier"}
@@ -550,133 +546,6 @@ def _classification_metrics(
     }
 
 
-_EVALUATION_CHECKPOINT_VERSION = 1
-
-
-def _evaluation_signature(
-    data: pd.DataFrame,
-    target_registry: pd.DataFrame,
-    feature_sets: dict[str, list[str]],
-    model_names: Sequence[str],
-    config: Any,
-    id_column: str,
-    formula_column: str,
-) -> str:
-    """Fingerprint the inputs that determine an evaluation run."""
-    targets = [str(value) for value in target_registry["target"].tolist()]
-    columns = list(
-        dict.fromkeys(
-            [id_column, formula_column, "cv_group"]
-            + targets
-            + [
-                column
-                for feature_columns in feature_sets.values()
-                for column in feature_columns
-            ]
-        )
-    )
-    missing = [column for column in columns if column not in data.columns]
-    if missing:
-        raise KeyError(f"Evaluation data are missing columns: {missing}")
-
-    metadata = {
-        "targets": target_registry.to_dict(orient="records"),
-        "feature_sets": {
-            str(name): [str(column) for column in feature_columns]
-            for name, feature_columns in feature_sets.items()
-        },
-        "model_names": list(model_names),
-        "config": (
-            dict(vars(config))
-            if hasattr(config, "__dict__")
-            else repr(config)
-        ),
-        "id_column": id_column,
-        "formula_column": formula_column,
-        "data_columns": columns,
-        "data_shape": tuple(data.shape),
-    }
-    digest = hashlib.sha256(
-        json.dumps(metadata, sort_keys=True, default=str).encode("utf-8")
-    )
-    safe_data = sklearn_safe_frame(data.loc[:, columns])
-    row_hashes = pd.util.hash_pandas_object(
-        safe_data,
-        index=True,
-        categorize=True,
-    )
-    digest.update(row_hashes.to_numpy(dtype="uint64").tobytes())
-    return digest.hexdigest()
-
-
-def _write_evaluation_checkpoint(
-    checkpoint_path: str | os.PathLike[str],
-    *,
-    signature: str,
-    scores: list[dict[str, Any]],
-    predictions: list[dict[str, Any]],
-    manifests: list[pd.DataFrame],
-    failures: list[dict[str, Any]],
-    splits: list[dict[str, Any]],
-    completed_units: set[tuple[str, str, str, str]],
-) -> None:
-    """Atomically persist the completed evaluation units and their outputs."""
-    path = Path(checkpoint_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary_path = path.with_name(f".{path.name}.tmp")
-    payload = {
-        "version": _EVALUATION_CHECKPOINT_VERSION,
-        "signature": signature,
-        "scores": scores,
-        "predictions": predictions,
-        "manifests": manifests,
-        "failures": failures,
-        "splits": splits,
-        "completed_units": completed_units,
-    }
-    with temporary_path.open("wb") as checkpoint_file:
-        pickle.dump(payload, checkpoint_file, protocol=pickle.HIGHEST_PROTOCOL)
-        checkpoint_file.flush()
-        os.fsync(checkpoint_file.fileno())
-    os.replace(temporary_path, path)
-
-
-def _read_evaluation_checkpoint(
-    checkpoint_path: str | os.PathLike[str],
-) -> dict[str, Any]:
-    path = Path(checkpoint_path)
-    with path.open("rb") as checkpoint_file:
-        payload = pickle.load(checkpoint_file)
-    if payload.get("version") != _EVALUATION_CHECKPOINT_VERSION:
-        raise ValueError(
-            f"Unsupported evaluation checkpoint version in {path}."
-        )
-    return payload
-
-
-def load_evaluation_checkpoint(
-    checkpoint_path: str | os.PathLike[str],
-):
-    """Load partial or complete results using the evaluation return format.
-
-    Only load checkpoint files that you created or otherwise trust, because
-    Python pickle files can execute code while being loaded.
-    """
-    payload = _read_evaluation_checkpoint(checkpoint_path)
-    manifests = payload.get("manifests", [])
-    return (
-        pd.DataFrame(payload.get("scores", [])),
-        pd.DataFrame(payload.get("predictions", [])),
-        (
-            pd.concat(manifests, ignore_index=True)
-            if manifests
-            else pd.DataFrame()
-        ),
-        pd.DataFrame(payload.get("failures", [])),
-        payload.get("splits", []),
-    )
-
-
 def evaluate_feature_sets(
     data: pd.DataFrame,
     target_registry: pd.DataFrame,
@@ -686,8 +555,6 @@ def evaluate_feature_sets(
     model_names: Sequence[str] | None = None,
     id_column: str = "material_id",
     formula_column: str = "formula",
-    checkpoint_path: str | os.PathLike[str] | None = None,
-    resume: bool = True,
 ):
     """Evaluate feature sets and algorithms on identical grouped splits.
 
@@ -696,13 +563,6 @@ def evaluate_feature_sets(
     model_names
         Sequence of model identifiers accepted by ``make_model``. If omitted,
         all models in ``DEFAULT_MODEL_NAMES`` are evaluated.
-    checkpoint_path
-        Optional pickle file used to save results atomically after every
-        completed (or failed) fold. Parent directories are created as needed.
-    resume
-        If True and ``checkpoint_path`` exists, load it and skip completed
-        target/feature-set/model/split combinations. A checkpoint whose inputs
-        do not match the current run is rejected.
 
     Notes
     -----
@@ -718,61 +578,6 @@ def evaluate_feature_sets(
     manifests: list[pd.DataFrame] = []
     failures: list[dict[str, Any]] = []
     splits: list[dict[str, Any]] = []
-    completed_units: set[tuple[str, str, str, str]] = set()
-
-    checkpoint = Path(checkpoint_path) if checkpoint_path is not None else None
-    signature = (
-        _evaluation_signature(
-            data,
-            target_registry,
-            feature_sets,
-            model_names,
-            config,
-            id_column,
-            formula_column,
-        )
-        if checkpoint is not None
-        else ""
-    )
-    if checkpoint is not None and resume and checkpoint.exists():
-        payload = _read_evaluation_checkpoint(checkpoint)
-        if payload.get("signature") != signature:
-            raise ValueError(
-                "The evaluation checkpoint does not match the current data, "
-                "targets, feature sets, models, or CV configuration. Use a "
-                "different checkpoint_path or set resume=False to replace it."
-            )
-        scores = payload.get("scores", [])
-        predictions = payload.get("predictions", [])
-        manifests = payload.get("manifests", [])
-        failures = payload.get("failures", [])
-        splits = payload.get("splits", [])
-        completed_units = set(payload.get("completed_units", set()))
-        print(
-            f"Resuming from {checkpoint}: "
-            f"{len(completed_units)} completed folds loaded."
-        )
-
-    def save_checkpoint() -> None:
-        if checkpoint is None:
-            return
-        _write_evaluation_checkpoint(
-            checkpoint,
-            signature=signature,
-            scores=scores,
-            predictions=predictions,
-            manifests=manifests,
-            failures=failures,
-            splits=splits,
-            completed_units=completed_units,
-        )
-
-    manifested_targets = {
-        str(manifest["target"].iloc[0])
-        for manifest in manifests
-        if not manifest.empty and "target" in manifest.columns
-    }
-    save_checkpoint()
 
     for _, spec in target_registry.iterrows():
         target, task = spec["target"], spec["task"]
@@ -797,12 +602,9 @@ def evaluate_feature_sets(
                 }
             )
             print(f"  skipped: {exc}")
-            save_checkpoint()
             continue
 
-        if str(target) not in manifested_targets:
-            manifests.append(manifest)
-            manifested_targets.add(str(target))
+        manifests.append(manifest)
         print(
             f"  {len(splits)} paired splits "
             f"({config.requested_repeats} repeats x "
@@ -819,16 +621,6 @@ def evaluate_feature_sets(
                 print(f"    model: {model_name}")
 
                 for split in splits:
-                    unit_key = (
-                        str(target),
-                        str(feature_set_name),
-                        str(model_name),
-                        str(split["split_id"]),
-                    )
-                    if unit_key in completed_units:
-                        print(f"      {split['split_id']}: checkpointed; skipped")
-                        continue
-
                     train_index = split["train_source_index"]
                     test_index = split["test_source_index"]
 
@@ -957,9 +749,6 @@ def evaluate_feature_sets(
                                 "error": repr(exc),
                             }
                         )
-
-                    completed_units.add(unit_key)
-                    save_checkpoint()
 
     return (
         pd.DataFrame(scores),
